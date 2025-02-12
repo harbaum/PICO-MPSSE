@@ -9,9 +9,9 @@ as a flash adapter for FPGA boards.
 
 | FTXXX  | JTAG | DIR | RP2040 |
 |--------|------|-----|--------|
-| D0     | TCK  |  O  |  24    |
-| D1     | TDI  |  O  |  21    |
-| D2     | TDO  |  I  |  22    |
+| D0     | TCK  |  O  |  18    |
+| D1     | TDI  |  O  |  16    |
+| D2     | TDO  |  I  |  17    |
 | D3     | TMS  |  O  |  19    |
 
 ## Usage
