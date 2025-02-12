@@ -1,16 +1,16 @@
 # USBMon mpsse parse
 
 This is a python script that reads usbmon traces written under Linux during a USB communication
-with a FTDI MPSSE device like e.g. the FT232H, FT2232 or FT4243.
+with a FTDI MPSSE device like the FT232H, FT2232 or FT4243.
 
-The trace is generated like e.g. on USB bus #1:
+The trace is generated for example for USB bus #1:
 
 ```
 $ sudo modprobe usbmon
 $ sudo cat /sys/kernel/debug/usb/usbmon/1u > trace.txt
 ```
 
-While this trace is being written e.g. openFPGAloader may be used:
+While this trace is being written Software like openFPGAloader or proprietary FPGA programming tools may be used:
 
 ```
 $ openFPGAloader --detect
@@ -35,10 +35,12 @@ Bus 001 Device 034: ID 0403:6010 Future Technology Devices International, Ltd FT
 ...
 ```
 
+it shows up as bus 1 and devices ce 34 in the trace.
+
 ## Example
 
 An example of a FTDI232H on USB Bus 1, Device 17 being used to detect
-a Efinix Trion T20 FPGA using openfpgaloader [is being included](ft232h_openfpgaloader_detect_t20_on_1:017.txt) as an example.
+a Efinix Trion T20 FPGA using openfpgaloader [is being included](ft232h_openfpgaloader_detect_t20_on_1:017.txt).
 
 It can be parsed like so:
 
