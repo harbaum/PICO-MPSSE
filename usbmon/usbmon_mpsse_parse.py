@@ -8,49 +8,69 @@
 # Related docs
 # https://www.ftdichip.com/Documents/AppNotes/AN_108_Command_Processor_for_MPSSE_and_MCU_Host_Bus_Emulation_Modes.pdf
 # https://github.com/lipro/libftdi/tree/master/src
+# https://github.com/radupotop/usbmon
 
 import sys
 
 print("USBMON MPSSE parser")
 
-# parse command line
-if len(sys.argv) < 3:
-    print("Usage:",sys.argv[0],"<trace> <bus>:<dev>")
+def usage():
+    print("Usage:",sys.argv[0],"[-n|-p=<file>|-v=<file>] <trace> <bus>:<dev>")
+    print("  -n        no colorized output")
+    print("  -p=<file> write programming data to <file>")
+    print("  -v=<file> verify programming data from <file>")
+
+    print("")
     print("  Get trace from usbmon for e.g. bus 1:")
     print("  $ sudo modprobe usbmon")
     print("  $ sudo cat /sys/kernel/debug/usb/usbmon/1u > usbmon_trace.txt")
+    print("  or use the usbmon command line utility to capture e.g. 4096 bytes")
+    print("  $ sudo usbmon -fu -i 1 -s 4096 > usbmon_trace.txt")
     sys.exit(-1)
 
-FILE = sys.argv[1]
-BUS = int(sys.argv[2].split(":")[0])
-DEV = int(sys.argv[2].split(":")[1])
+# parse command line
+option_color = True        # use colors by default
+option_prog_file = None    # 
+option_verify_file = None  # 
 
-# some ansi color codes for output
-BLACK = "\033[0;30m"
-RED = "\033[0;31m"
-GREEN = "\033[0;32m"
-BROWN = "\033[0;33m"
-BLUE = "\033[0;34m"
-PURPLE = "\033[0;35m"
-CYAN = "\033[0;36m"
-LIGHT_GRAY = "\033[0;37m"
-DARK_GRAY = "\033[1;30m"
-LIGHT_RED = "\033[1;31m"
-LIGHT_GREEN = "\033[1;32m"
-YELLOW = "\033[1;33m"
-LIGHT_BLUE = "\033[1;34m"
-LIGHT_PURPLE = "\033[1;35m"
-LIGHT_CYAN = "\033[1;36m"
-LIGHT_WHITE = "\033[1;37m"
-BOLD = "\033[1m"
-FAINT = "\033[2m"
-ITALIC = "\033[3m"
-UNDERLINE = "\033[4m"
-BLINK = "\033[5m"
-NEGATIVE = "\033[7m"
-CROSSED = "\033[9m"
-END = "\033[0m"
+index = 1
+while index < len(sys.argv) and sys.argv[index][0] == "-":
+    if sys.argv[index][1]     == "n": option_color = False
+    elif sys.argv[index][1:3] == "p=": option_prog_file = sys.argv[index][3:]
+    elif sys.argv[index][1:3] == "v=": option_verify_file = sys.argv[index][3:]
+    else: usage()    
+    index += 1
+
+# we need to more non-option parameters
+if len(sys.argv) < 2+index: usage()
     
+FILE = sys.argv[index]
+BUS = int(sys.argv[index+1].split(":")[0])
+DEV = int(sys.argv[index+1].split(":")[1])
+
+if option_color:
+    # some ansi color codes for output
+    RED = "\033[0;31m"; GREEN = "\033[0;32m"; BROWN = "\033[0;33m"; BLUE = "\033[0;34m"; PURPLE = "\033[0;35m";
+    CYAN = "\033[0;36m"; LIGHT_GRAY = "\033[0;37m"; DARK_GRAY = "\033[1;30m"; LIGHT_RED = "\033[1;31m";
+    LIGHT_GREEN = "\033[1;32m"; YELLOW = "\033[1;33m"; LIGHT_BLUE = "\033[1;34m"; LIGHT_PURPLE = "\033[1;35m";
+    LIGHT_CYAN = "\033[1;36m"; LIGHT_WHITE = "\033[1;37m"; END = "\033[0m";
+else:
+    # no colors
+    RED = ""; GREEN = ""; BROWN = ""; BLUE = ""; PURPLE = ""; CYAN = ""; LIGHT_GRAY = ""; DARK_GRAY = "";
+    LIGHT_RED = ""; LIGHT_GREEN = ""; YELLOW = ""; LIGHT_BLUE = ""; LIGHT_PURPLE = ""; LIGHT_CYAN = "";
+    LIGHT_WHITE = ""; END = "";
+
+# open programming data file if needed
+if option_prog_file:
+    option_prog_file = open(option_prog_file, "wb")
+
+if option_verify_file:
+    option_verify_file = open(option_verify_file, "rb")
+
+def hexlimit(data, maxlen):
+    if len(data) <= maxlen: return ' '.join(format(x, '02x') for x in data)
+    else:                   return ' '.join(format(x, '02x') for x in data[:maxlen]) + " ..."
+
 INSTRUCTIONS = {
     "Gowin": {    
         0x02: "NOOP",
@@ -126,7 +146,7 @@ def instruction_parse(ir, dlen):
 
     if dlen != device[3]:
         print(LIGHT_RED+"Warning: Cmd len", dlen, "!=", device[3],",",end=" ")
-        print(hex(ir),"->",hex(ir & (1<<device[3])-1),END,end="")
+        print(hex(ir),"->",hex(ir & (1<<device[3])-1),END + YELLOW,end="")
         ir = ir & (1<<device[3])-1
 
     if not ir in INSTRUCTIONS[device[0]]:
@@ -152,7 +172,6 @@ def parse_id_code(data):
             print("JTAG: Family:", device[1])
             print("JTAG: Model:", device[2])
             print("JTAG: IR length:", device[3])
-
         else:
             device = None
             print("JTAG: Manufacturer: ", hex((idcode >> 1) & 0x7ff))
@@ -189,10 +208,7 @@ def gowin_status_parse(status):
 def data_out_parse(data):
     global SHIFT_CNT, IR
 
-    if len(data) <= 16:    
-        print("JTAG: DR data out", ' '.join(format(x, '02x') for x in data))
-    else:
-        print("JTAG: DR data out", ' '.join(format(x, '02x') for x in data[:16]), "total:", len(data))
+    print("JTAG: DR data out["+str(len(data))+"], "+hexlimit(data,16))
 
     # the data received this way should actually match the length
     # if the data shifted in before    
@@ -216,13 +232,55 @@ def data_out_parse(data):
                     parse_id_code(data)    
 
 # TODO: rename DR_REPLY to data_in or so ... as it can also be used for reading the ir
+verify_putback = None
+verify_skipped = 0
+verify_index = 0
+verify_mismatch = 0
 def data_in_parse(dr, dlen):
-    global DR_REPLY
+    global DR_REPLY, INSTRUCTIONS, IR, DR, verify_putback, verify_skipped, verify_index, verify_mismatch, option_verify_file
 
-    print("JTAG: DR loaded with", dlen, "("+ str(dlen//8)+"+"+str(dlen%8)+")", "bits", end="")
-    if dlen <= 48: print(":", hex(dr))
-    else:          print("")
+    # if dlen%8 == 1 it's very likely, that this is the extra bit generated when leaving 'SHIFT DR' state
+    
+    print("JTAG: DR loaded with", dlen, "("+ str(dlen//8)+"*8+"+str(dlen%8)+")", "bits: " + hexlimit(DR,32))
 
+    # if the current ir is something with "program" then write the data out
+    if device and device[0] in INSTRUCTIONS and IR in INSTRUCTIONS[device[0]] and "program" in  INSTRUCTIONS[device[0]][IR].lower():
+        # adjust bit order from LSB to MSB
+        for byte in DR:
+            byte = ((byte & 0x55) << 1) | ((byte & 0xaa) >> 1)
+            byte = ((byte & 0x33) << 2) | ((byte & 0xcc) >> 2)
+            byte = ((byte & 0x0f) << 4) | ((byte & 0xf0) >> 4)
+
+            # simply write all bytes to file
+            if option_prog_file:
+                option_prog_file.write(bytes([byte]))
+
+            # the verify option is somewhat special as it tries to skip and report zero
+            # bytes that have been inserted by the programmer tool as e.g. efinity does
+            if option_verify_file:
+                if verify_putback != None:
+                    vbyte = verify_putback
+                    verify_putback = None
+                else:
+                    # Read byte from file to compare to. use -1 if end of file reached
+                    # since -1 will never match. This will be reported at the end
+                    readbyte = option_verify_file.read(1)
+                    if len(readbyte): vbyte = int.from_bytes(readbyte)
+                    else:             vbyte = -1
+                        
+                if vbyte != byte:
+                    verify_mismatch += 1
+                    verify_putback = vbyte
+                else:
+                    if verify_mismatch:
+                        print(LIGHT_RED+"Verify mismatch", verify_mismatch, "at", verify_index-verify_mismatch, END)
+                        verify_mismatch = 0
+
+                verify_index += 1
+
+        if verify_mismatch:
+            print(LIGHT_RED+"Verify overrun", verify_mismatch, "at", verify_index-verify_mismatch, END)
+    
     data_out_parse(DR_REPLY)
         
 def jtag_parse(tms_in, tdi, reading):
@@ -239,16 +297,20 @@ def jtag_parse(tms_in, tdi, reading):
         IR |= tdi << SHIFT_CNT[0]
         
     if jtag_state == "SHIFT DR":
-        DR |= tdi << SHIFT_CNT[0]
+        # DR will grow pretty much, so we handle this as a array of bytes
+        if SHIFT_CNT[0] & 7 == 0:
+            # first bit of byte
+            DR.append(0)
+            DR[-1] |= tdi
+        else:
+            DR[-1] |= tdi << (SHIFT_CNT[0]&7)
         
     if jtag_state.startswith("SHIFT "):
-        # print(CYAN+"<R"+str(SHIFT_CNT)+">", END)
         # SHIFT_CNT[0] counts the bits actually written
         SHIFT_CNT[0] += 1
 
         # SHIFT_CNT[1] counts the bits read and expected to be returned via BULK OUT
         if reading:
-            # print(CYAN+"<R"+str(SHIFT_CNT[1])+">", END)
             SHIFT_CNT[1] += 1
        
     # ---------------- TMS -------------------
@@ -281,12 +343,11 @@ def jtag_parse(tms_in, tdi, reading):
             
         # just reached a SHIFT state?
         if jtag_state.startswith("SHIFT "):
-            # print(CYAN, "<CLR",SHIFT_CNT,">", END)
             SHIFT_CNT = [0,0]        
         if jtag_state == "SHIFT IR":
             IR = 0
         if jtag_state == "SHIFT DR":
-            DR = 0
+            DR = []
             DR_REPLY = []
 
 # The parts list only contains a few parts I've ever seen. Feel free to add more
@@ -326,7 +387,7 @@ def parse_bulk_data_in(data, cmd = None):
 
     # skip FTDI header
     data = data[2:]    
-    print(GREEN+"< TDO", ' '.join(format(x, '02x') for x in data), END)
+    print(GREEN+"< TDO", hexlimit(data, 32), END)
 
     # simply append this data to the DR_REPLY register
     DR_REPLY += data
@@ -355,12 +416,12 @@ def parse_mpsse_shift(cmd, data):
     if cmd & 0x10: bit_str.append("W-TDI")
     if cmd & 0x20: bit_str.append("R-TDO")
     if cmd & 0x40: bit_str.append("W-TMS")
-    print("SHIFT", ",".join(bit_str), "LEN="+str(length), "("+str(length//8)+"+"+str(length%8)+")" )
+    print("SHIFT", ",".join(bit_str), "LEN="+str(length), "("+str(length//8)+"*8+"+str(length%8)+")" )
     
     # check if TMS is to be controlled, then
     # TDI is encoded in first bit (MSB)
     if cmd & 0x40: # <W-TMS>
-        print(GREEN+"> TMS", ' '.join(format(x, '02x') for x in data[:(length+7)//8]), END)
+        print(GREEN+"> TMS", hexlimit(data[:(length+7)//8], 32), END)
 
         # we never expect TDI writing to be enabled as well
         if cmd & 0x10: # <W-TDI>
@@ -383,8 +444,7 @@ def parse_mpsse_shift(cmd, data):
         data = data[1:]
     elif cmd & 0x10: #  <W-TDI>
         # regular TDI mode. This will not change the state of TMS
-        if (length+7)//8 <= 32: print(GREEN+"> TDI", ' '.join(format(x, '02x') for x in data[:(length+7)//8]), END)
-        else:                   print(GREEN+"> TDI["+str(length)+"]", ' '.join(format(x, '02x') for x in data[:32]), "...", END)
+        print(GREEN+"> TDI["+str(length)+"]", hexlimit(data[:(length+7)//8], 32), END)
             
         # captured data may actually be too short
         while length and len(data):
@@ -404,16 +464,15 @@ def parse_mpsse_shift(cmd, data):
         # print("<no data to be written>")
         # increase the SHIFT_CNT[0], anyways as we'll compare that with the
         # length of data transferred via bulk out
-        # print(CYAN+"SHIFT_CNT += ", length, END)
         SHIFT_CNT[1] += length
             
     # we always expect W-VE- when writing with <W-TDI> or <W-TMS> bits set
     if cmd & (0x10 | 0x40) and not cmd & 0x01:
-        print(LIGHT_RED + "Warning: Unexpected W+VE" + END)
+        print(LIGHT_RED + "Warning: Unexpected W+VE. JTAG should write on the falling edge!" + END)
 
     # we always expect R-VE+ when reading with <R-TDO>
     if cmd & 0x20 and cmd & 0x04:
-        print(LIGHT_RED + "Warning: Unexpected R-VE" + END)
+        print(LIGHT_RED + "Warning: Unexpected R-VE. JTAG should read on the rising edge!" + END)
 
     if not cmd & 0x08:
         print(LIGHT_RED + "Warning: Unexpected MSB first" + END)
@@ -549,9 +608,10 @@ def parse_bulk_out(data):
 
 # a buffer, to keep data until a command is complete
 bulk_out_buffer = None
+truncated_data = False
 
 def parse_line(line):
-    global bulk_out_buffer
+    global bulk_out_buffer, truncated_data
 
     parts = line.split()
 
@@ -648,21 +708,19 @@ def parse_line(line):
             data = None
 
         if data and dir == "in":
-            print(CYAN+"USB BULK IN", ' '.join(format(x, '02x') for x in data), END)
+            print(CYAN+"USB BULK IN", hexlimit(data, 32), END)
             parse_bulk_data_in(data)
         
         if data and dir == "out":
-            # submissions only capture up to 32 bytes. Fill it up with x00 bytes hoping that this
+            # usbmon be default captures up to 32 bytes. Fill it up with x00 bytes hoping that this
             # is still parsable. This may (and does) cause trouble at the end of long transfers if the
             # missing parts are supposed to be further commands and not just data
             if length > len(data):
                 # print(LIGHT_RED, "Missing", length-len(data), "bytes. Filling up with 00", END)
                 data += [0]*(length-len(data))
-            
-            if len(data) <= 32:
-                print(CYAN+"USB BULK OUT", ' '.join(format(x, '02x') for x in data), END)
-            else:
-                print(CYAN+"USB BULK OUT["+str(len(data))+"]", ' '.join(format(x, '02x') for x in data[:32]), "...", END)
+                truncated_data = True
+
+            print(CYAN+"USB BULK OUT["+str(len(data))+"]: "+hexlimit(data,32)+END)
 
             # There's unused data from previous transfer(s)? Prepend it. This actually barely happens in real
             # life.
@@ -675,7 +733,8 @@ def parse_line(line):
 
             if data:
                 bulk_out_buffer = data
-                    
+
+# open trace file and run over it
 with open(FILE, "r") as f:
     for line in f:
         line = line.strip()
@@ -685,3 +744,11 @@ with open(FILE, "r") as f:
             print("While parsing", line)
             print("Exception:", e)
             sys.exit(-1)
+
+if option_prog_file: option_prog_file.close()
+
+if option_verify_file:
+    option_verify_file.close()
+
+if truncated_data:
+    print(LIGHT_RED + "Warning, the captured data was truncated and some parsing may have been incorrect.", END)

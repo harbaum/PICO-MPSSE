@@ -10,7 +10,18 @@ $ sudo modprobe usbmon
 $ sudo cat /sys/kernel/debug/usb/usbmon/1u > trace.txt
 ```
 
-While this trace is being written Software like openFPGAloader or proprietary FPGA programming tools may be used:
+Alternally and especially if all traffic needs to be captured the
+[usbmon command line utility](https://github.com/radupotop/usbmon)
+ should be used instead. The following will make sure the up
+ to 4096 bytes are being captured per USB transfer:
+
+```
+$ sudo modprobe usbmon
+$ sudo usbmon -fu -i 1 -s 4096 > trace.txt
+```
+
+As long as this trace is being written software like [openFPGAloader](https://github.com/trabucayre/openFPGALoader) or proprietary
+FPGA programming tools may be used:
 
 ```
 $ openFPGAloader --detect
