@@ -9,6 +9,9 @@
 # https://www.ftdichip.com/Documents/AppNotes/AN_108_Command_Processor_for_MPSSE_and_MCU_Host_Bus_Emulation_Modes.pdf
 # https://github.com/lipro/libftdi/tree/master/src
 # https://github.com/radupotop/usbmon
+# https://github.com/lipro/libftdi/blob/master/src/ftdi.h
+
+# TODO: handle both ports seperately
 
 import sys
 
@@ -67,34 +70,24 @@ if option_prog_file:
 if option_verify_file:
     option_verify_file = open(option_verify_file, "rb")
 
-def hexlimit(data, maxlen):
-    if len(data) <= maxlen: return ' '.join(format(x, '02x') for x in data)
-    else:                   return ' '.join(format(x, '02x') for x in data[:maxlen]) + " ..."
-
+def hexlimit(title, data, maxlen=32):
+    if title: retval = title + "[" + str(len(data)) + "]: "
+    else: retval = ""
+    
+    if len(data) <= maxlen: retval += ' '.join(format(x, '02x') for x in data)
+    else:                   retval +=  ' '.join(format(x, '02x') for x in data[:maxlen]) + " ..."
+    return retval
+    
+# JTAG instructions as used by the different FPGA vendors
 INSTRUCTIONS = {
     "Gowin": {    
-        0x02: "NOOP",
-        0x03: "READ SRAM",
-        0x05: "ERASE SRAM",    
-        0x09: "XFER DONE",
-        0x11: "READ ID CODE",
-        0x12: "INIT ADDR",
-        0x13: "READ USERCODE",
-        0x15: "CONFIG ENABLE",
-        0x17: "XFER WRITE",
-        0x3a: "CONFIG DISABLE",
-        0x3c: "RELOAD",
-        0x41: "STATUS REGISTER"
-    },
+        0x02: "NOOP", 0x03: "READ SRAM", 0x05: "ERASE SRAM",0x09: "XFER DONE",
+        0x11: "READ ID CODE", 0x12: "INIT ADDR", 0x13: "READ USERCODE",
+        0x15: "CONFIG ENABLE", 0x17: "XFER WRITE", 0x3a: "CONFIG DISABLE",
+        0x3c: "RELOAD", 0x41: "STATUS REGISTER" },
     "efinix": {
-        0x02: "SAMPLE PRELOAD",
-        0x00: "EXTEST",
-        0x0f: "BYPASS",
-        0x03: "IDCODE",
-        0x04: "PROGRAM",
-        0x07: "ENTERUSER",
-        0x08: "USER1"
-    }
+        0x02: "SAMPLE PRELOAD", 0x00: "EXTEST", 0x0f: "BYPASS", 0x03: "IDCODE",
+        0x04: "PROGRAM", 0x07: "ENTERUSER", 0x08: "USER1" }
 }
 
 # JTAG states
@@ -120,13 +113,20 @@ JTAG_STATES = {
     "UPDATE IR": ("RUN TEST IDLE", "SELECT DR SCAN")
 }
 
+port_mode = None
+
 # JTAG state machine
-jtag_state = "TEST LOGIC RESET"
-TMS = None
-IR = None
-DR = None
-DR_REPLY = None
-SHIFT_CNT = [0,0]
+jtag = {
+    "state": "TEST LOGIC RESET",        # state of JTAG state machine
+    "shift_cnt": { "out": 0, "in": 0 }, # counter for in/out shifting
+
+    "tms": None,                        # current state of TMS signal
+    "ir": None,                         # jtag instruction register written by host
+    "dr": None,                         # jtag data register written by host
+
+    # jtag data returned by device
+    "dr_return": { "data": [], "length": 0, "expect": [], "premature": [] }
+}
 
 # keep track of detected device to be able to parse further
 # communication correctly
@@ -205,86 +205,92 @@ def gowin_status_parse(status):
             status_list.append(GOWIN_STATUS_BITS[i])
     print(",".join(status_list))
     
-def data_out_parse(data):
-    global SHIFT_CNT, IR
+def data_out_parse(reply):
+    global jtag
 
-    print("JTAG: DR data out["+str(len(data))+"], "+hexlimit(data,16))
+    print("JTAG: "+hexlimit("DR data out", reply["data"]))
 
     # the data received this way should actually match the length
     # if the data shifted in before    
-    if 8*len(data) != SHIFT_CNT[1]:
-        print(LIGHT_RED + "Warning: Expected", SHIFT_CNT[1], "bits in return, got", 8*len(data), END)
+    if reply["length"] != jtag["shift_cnt"]["out"]:
+        print(LIGHT_RED + "Warning: Expected", jtag["shift_cnt"]["out"], "bits in return, got", reply["length"], END)
     
     # no IR written yet, so this is the idcode
-    if IR == None:
-        parse_id_code(data)
+    if jtag["ir"] == None:
+        parse_id_code(reply["data"])
     else:
         # IR set, so parse device specific instructions            
         if device:
             if device[0] == "Gowin":
-                if IR == 0x11:
-                    parse_id_code(data)
-                if IR == 0x41:
-                    gowin_status_parse(int.from_bytes(bytes(data), byteorder='little', signed=False))
+                if jtag["ir"] == 0x11:
+                    parse_id_code(reply["data"])
+                if jtag["ir"] == 0x41:
+                    gowin_status_parse(int.from_bytes(bytes(reply["data"]), byteorder='little', signed=False))
 
             elif device[0] == "efinix":
-                if IR == 0x03:
-                    parse_id_code(data)    
+                if jtag["ir"] == 0x03:
+                    parse_id_code(reply["data"])    
 
-# TODO: rename DR_REPLY to data_in or so ... as it can also be used for reading the ir
-verify_putback = None
-verify_skipped = 0
-verify_index = 0
-verify_mismatch = 0
+# state needed when verifying the data we see as "program" payload with data from a reference file
+verify = { "putback": None, "index": 0, "mismatch": 0 }
+
 def data_in_parse(dr, dlen):
-    global DR_REPLY, INSTRUCTIONS, IR, DR, verify_putback, verify_skipped, verify_index, verify_mismatch, option_verify_file
+    global INSTRUCTIONS, jtag, verify, option_verify_file
 
     # if dlen%8 == 1 it's very likely, that this is the extra bit generated when leaving 'SHIFT DR' state
     
-    print("JTAG: DR loaded with", dlen, "("+ str(dlen//8)+"*8+"+str(dlen%8)+")", "bits: " + hexlimit(DR,32))
+    print("JTAG: DR loaded with", dlen, "("+ str(dlen//8)+"*8+"+str(dlen%8)+")", "bits: " + hexlimit(None,jtag["dr"]))
 
     # if the current ir is something with "program" then write the data out
-    if device and device[0] in INSTRUCTIONS and IR in INSTRUCTIONS[device[0]] and "program" in  INSTRUCTIONS[device[0]][IR].lower():
-        # adjust bit order from LSB to MSB
-        for byte in DR:
-            byte = ((byte & 0x55) << 1) | ((byte & 0xaa) >> 1)
-            byte = ((byte & 0x33) << 2) | ((byte & 0xcc) >> 2)
-            byte = ((byte & 0x0f) << 4) | ((byte & 0xf0) >> 4)
+    if device and device[0] in INSTRUCTIONS and jtag["ir"] in INSTRUCTIONS[device[0]]:
+        if "bypass" in  INSTRUCTIONS[device[0]][jtag["ir"]].lower():
+            # TODO: check for correct return data in bypass mode
+            # hmmm ... the efinity programmer never leaves the shift dr state for this ...
+            print(LIGHT_GREEN+"Bypass", jtag["dr"], dr, END)
 
-            # simply write all bytes to file
-            if option_prog_file:
-                option_prog_file.write(bytes([byte]))
+        if "program" in  INSTRUCTIONS[device[0]][jtag["ir"]].lower():
+            print(YELLOW+"Programmed", device[0], "device with", dlen, "bits.", END)
+            
+            # adjust bit order from LSB to MSB
+            for byte in jtag["dr"]:
+                byte = ((byte & 0x55) << 1) | ((byte & 0xaa) >> 1)
+                byte = ((byte & 0x33) << 2) | ((byte & 0xcc) >> 2)
+                byte = ((byte & 0x0f) << 4) | ((byte & 0xf0) >> 4)
 
-            # the verify option is somewhat special as it tries to skip and report zero
-            # bytes that have been inserted by the programmer tool as e.g. efinity does
-            if option_verify_file:
-                if verify_putback != None:
-                    vbyte = verify_putback
-                    verify_putback = None
-                else:
-                    # Read byte from file to compare to. use -1 if end of file reached
-                    # since -1 will never match. This will be reported at the end
-                    readbyte = option_verify_file.read(1)
-                    if len(readbyte): vbyte = int.from_bytes(readbyte)
-                    else:             vbyte = -1
+                # simply write all bytes to file
+                if option_prog_file:
+                    option_prog_file.write(bytes([byte]))
+
+                # the verify option is somewhat special as it tries to skip and report zero
+                # bytes that have been inserted by the programmer tool as e.g. efinity does
+                if option_verify_file:
+                    if verify["putback"] != None:
+                        vbyte = verify["putback"]
+                        verify["putback"] = None
+                    else:
+                        # Read byte from file to compare to. use -1 if end of file reached
+                        # since -1 will never match. This will be reported at the end
+                        readbyte = option_verify_file.read(1)
+                        if len(readbyte): vbyte = int.from_bytes(readbyte)
+                        else:             vbyte = -1
                         
-                if vbyte != byte:
-                    verify_mismatch += 1
-                    verify_putback = vbyte
-                else:
-                    if verify_mismatch:
-                        print(LIGHT_RED+"Verify mismatch", verify_mismatch, "at", verify_index-verify_mismatch, END)
-                        verify_mismatch = 0
+                    if vbyte != byte:
+                        verify["mismatch"] += 1
+                        verify["putback"] = vbyte
+                    else:
+                        if verify["mismatch"]:
+                            print(LIGHT_RED+"Verify mismatch", verify["mismatch"], "at", verify["index"]-verify["mismatch"], END)
+                            verify["mismatch"] = 0
 
-                verify_index += 1
+                    verify["index"] += 1
 
-        if verify_mismatch:
-            print(LIGHT_RED+"Verify overrun", verify_mismatch, "at", verify_index-verify_mismatch, END)
+            if verify["mismatch"]:
+                print(LIGHT_RED+"Verify overrun", verify["mismatch"], "at", verify["index"]-verify["mismatch"], END)
     
-    data_out_parse(DR_REPLY)
+    data_out_parse(jtag["dr_return"])
         
 def jtag_parse(tms_in, tdi, reading):
-    global jtag_state, IR, TMS, SHIFT_CNT, DR, DR_REPLY
+    global jtag
 
     # print(PURPLE+"TDI", tdi, "TMS", tms_in, END)
         
@@ -293,62 +299,65 @@ def jtag_parse(tms_in, tdi, reading):
     # handle TDI first as TMS state changes do not take
     # effect before the next cycle
 
-    if jtag_state == "SHIFT IR":
-        IR |= tdi << SHIFT_CNT[0]
+    if jtag["state"] == "SHIFT IR":
+        jtag["ir"] |= tdi << jtag["shift_cnt"]["in"]
         
-    if jtag_state == "SHIFT DR":
+    if jtag["state"] == "SHIFT DR":
         # DR will grow pretty much, so we handle this as a array of bytes
-        if SHIFT_CNT[0] & 7 == 0:
+        if jtag["shift_cnt"]["in"] & 7 == 0:
             # first bit of byte
-            DR.append(0)
-            DR[-1] |= tdi
+            jtag["dr"].append(0)
+            jtag["dr"][-1] |= tdi
         else:
-            DR[-1] |= tdi << (SHIFT_CNT[0]&7)
+            jtag["dr"][-1] |= tdi << (jtag["shift_cnt"]["in"]&7)
         
-    if jtag_state.startswith("SHIFT "):
-        # SHIFT_CNT[0] counts the bits actually written
-        SHIFT_CNT[0] += 1
+    if jtag["state"].startswith("SHIFT "):
+        # jtag["shift_cnt"]["in"] counts the bits actually written
+        jtag["shift_cnt"]["in"] += 1
 
-        # SHIFT_CNT[1] counts the bits read and expected to be returned via BULK OUT
+        # jtag["shift_cnt"]["out"] counts the bits read and expected to be returned via BULK OUT
         if reading:
-            SHIFT_CNT[1] += 1
+            jtag["shift_cnt"]["out"] += 1
        
     # ---------------- TMS -------------------
     
-    if not jtag_state in JTAG_STATES:
-        print("Don't know how to proceed from", jtag_state)
+    if not jtag["state"] in JTAG_STATES:
+        print("Don't know how to proceed from", jtag["state"])
         sys.exit(-1)
 
-    state = JTAG_STATES[jtag_state]
+    state = JTAG_STATES[jtag["state"]]
     if tms_in != None:
-        TMS = tms_in  # remember new TMS state
+        jtag["tms"] = tms_in  # remember new TMS state
         
-    if state[TMS]:
+    if state[jtag["tms"]]:
         # it's actually unexpected that an implicit TMS value
         # changes the state. So let's keep an eye on that
         if tms_in == None:
             print("Implicit JTAG state change")
             sys.exit(1)
 
-        jtag_state = state[TMS]
-        print("JTAG: TDI", tdi, "TMS", tms_in, "->", jtag_state)
+        jtag["state"] = state[jtag["tms"]]
+        print("JTAG: TDI", tdi, "TMS", tms_in, "->", jtag["state"])
 
         # entering UPDATE DR state?
         # (checking TMS is not needed dur to state[TMS] being None)
-        if jtag_state == "UPDATE DR": data_in_parse(DR, SHIFT_CNT[0])
+        if jtag["state"] == "UPDATE DR": data_in_parse(jtag["dr"], jtag["shift_cnt"]["in"])
             
         # entering UPDATE IR state?
         # (checking TMS is not needed due to state[TMS] being None)
-        if jtag_state == "UPDATE IR": instruction_parse(IR, SHIFT_CNT[0])
+        if jtag["state"] == "UPDATE IR": instruction_parse(jtag["ir"], jtag["shift_cnt"]["in"])
             
         # just reached a SHIFT state?
-        if jtag_state.startswith("SHIFT "):
-            SHIFT_CNT = [0,0]        
-        if jtag_state == "SHIFT IR":
-            IR = 0
-        if jtag_state == "SHIFT DR":
-            DR = []
-            DR_REPLY = []
+        if jtag["state"].startswith("SHIFT "):
+            # print(LIGHT_PURPLE + "RESET jtag["shift_cnt"]" + END)
+            jtag["shift_cnt"]["in"] = 0        
+            jtag["shift_cnt"]["out"] = 0        
+        if jtag["state"] == "SHIFT IR":
+            jtag["ir"] = 0
+        if jtag["state"] == "SHIFT DR":
+            jtag["dr"] = []
+            jtag["dr_return"]["data"] = []
+            jtag["dr_return"]["length"] = 0
 
 # The parts list only contains a few parts I've ever seen. Feel free to add more
 # e.g. from openFPGAloader/src/part.hpp
@@ -374,9 +383,60 @@ PARTS = {
     0x0001181b: ("Gowin", "GW5AT",  "GW5AT-138",  8)
 }
 
-def parse_bulk_data_in(data, cmd = None):
-    global IR, DR_REPLY
+def check_for_expected_data(data = []):
+    global jtag
 
+    # Prepend any data that have been received before we've seen the
+    # request for it. This happens for some odd reason like e.g. a
+    # race condition in the usbmon
+    if jtag["dr_return"]["premature"]:
+        data = jtag["dr_return"]["premature"] + data
+        jtag["dr_return"]["premature"] = []
+
+    # no data to be processed, not even "premature" data
+    if not data: return        
+    
+    #print(LIGHT_PURPLE + ">>> INCOMING <<<")
+
+    # the shift commands
+    #print(hexlimit("data", data))
+    #print("expect:", jtag["dr_return"]["expect"], "shift_cnt:", jtag["shift_cnt"], jtag["dr_return"]["length"])
+
+    # in some traces we've seen the reply before the request ...
+    #if not len(jtag["dr_return"]["expect"]):
+    #    print(LIGHT_RED + "Warning: no data expected!" + END + LIGHT_PURPLE)
+    
+    # walk over all expected bit patterns and parse incoming
+    # data according to this. This would normally be done by the
+    # application (e.g. openfpgaloader) itself. But since we've
+    # observed the actual requests we can correctly parse
+    # these as well.
+    
+    # process all data bytes
+    while len(jtag["dr_return"]["expect"]) and len(data):
+        # walk over all bits
+        for b in range(jtag["dr_return"]["expect"][0]):
+            if jtag["dr_return"]["length"]&7 == 0: jtag["dr_return"]["data"].append(0)
+            # copy bit
+            if data[0] & (0x80>>(b&7)): jtag["dr_return"]["data"][-1] |= (0x80>>(jtag["dr_return"]["length"]&7))
+            # fully read one source byte?
+            if b&7 == 7: data = data[1:]
+            jtag["dr_return"]["length"] += 1
+
+        # if jtag["dr_return"]["expect"][0] wasn't a multiple of 8 then there's still unused bits in the last
+        # data byte. This needs to be discarded.
+        if jtag["dr_return"]["expect"][0] & 7: data = data[1:]
+            
+        # expected data has been handled
+        jtag["dr_return"]["expect"] = jtag["dr_return"]["expect"][1:]
+
+    if len(data):
+        jtag["dr_return"]["premature"].extend(data)
+        
+    # print(hexlimit("DR return"+"("+str(jtag["dr_return"]["length"])+" bits)", jtag["dr_return"]["data"]), END)
+
+# bulk data in the the reply from the FTDI chip
+def parse_bulk_data_in(data, cmd = None):
     if len(data) < 2: return
     
     # the first two bytes always seem to be 0xxx 0x60 and carrying the line status
@@ -387,13 +447,12 @@ def parse_bulk_data_in(data, cmd = None):
 
     # skip FTDI header
     data = data[2:]    
-    print(GREEN+"< TDO", hexlimit(data, 32), END)
+    print(GREEN+hexlimit("<TDO ", data), END)
 
-    # simply append this data to the DR_REPLY register
-    DR_REPLY += data
+    check_for_expected_data(data)
 
 def parse_mpsse_shift(cmd, data):
-    global SHIFT_CNT
+    global jtag
     
     if cmd & 2:
         # bits        
@@ -417,11 +476,17 @@ def parse_mpsse_shift(cmd, data):
     if cmd & 0x20: bit_str.append("R-TDO")
     if cmd & 0x40: bit_str.append("W-TMS")
     print("SHIFT", ",".join(bit_str), "LEN="+str(length), "("+str(length//8)+"*8+"+str(length%8)+")" )
+
+    # maintain a list of bytes expected to be read
+    if cmd & 0x20:
+        # print(LIGHT_PURPLE + "READ", length, END)
+        jtag["dr_return"]["expect"].append(length)
+        check_for_expected_data([])        
     
     # check if TMS is to be controlled, then
     # TDI is encoded in first bit (MSB)
     if cmd & 0x40: # <W-TMS>
-        print(GREEN+"> TMS", hexlimit(data[:(length+7)//8], 32), END)
+        print(GREEN+hexlimit("> TMS", data[:(length+7)//8]), END)
 
         # we never expect TDI writing to be enabled as well
         if cmd & 0x10: # <W-TDI>
@@ -444,7 +509,7 @@ def parse_mpsse_shift(cmd, data):
         data = data[1:]
     elif cmd & 0x10: #  <W-TDI>
         # regular TDI mode. This will not change the state of TMS
-        print(GREEN+"> TDI["+str(length)+"]", hexlimit(data[:(length+7)//8], 32), END)
+        print(GREEN+hexlimit(">TDI", data[:(length+7)//8]), END)
             
         # captured data may actually be too short
         while length and len(data):
@@ -462,9 +527,9 @@ def parse_mpsse_shift(cmd, data):
     else:
         # if not data is to be written, then no data is transferred at all
         # print("<no data to be written>")
-        # increase the SHIFT_CNT[0], anyways as we'll compare that with the
+        # increase the jtag["shift_cnt"]["in"], anyways as we'll compare that with the
         # length of data transferred via bulk out
-        SHIFT_CNT[1] += length
+        jtag["shift_cnt"]["out"] += length
             
     # we always expect W-VE- when writing with <W-TDI> or <W-TMS> bits set
     if cmd & (0x10 | 0x40) and not cmd & 0x01:
@@ -510,8 +575,7 @@ def mpsse_cmd_is_complete(data):
 
     return True
 
-def parse_bulk_out(data):
-
+def parse_bulk_out_mpsse(data):
     # parse mpsse command byte
     print("MPSSE: CMD "+hex(data[0])+" -> ", end="")
 
@@ -606,12 +670,30 @@ def parse_bulk_out(data):
         print("Unknown command", hex(data[0]))
     return None
 
+def parse_bulk_out_bitbang(data):
+    print(LIGHT_PURPLE + hexlimit("BITBANG", data) + END)
+    
+def parse_bulk_out(data):
+    global port_mode
+    
+    # check if we are in MPSSE mode
+    if port_mode.lower() == "mpsse":
+        while data and mpsse_cmd_is_complete(data):
+            data = parse_bulk_out_mpsse(data)
+        return data
+    elif port_mode.lower() == "bitbang":
+        parse_bulk_out_bitbang(data)
+    else:
+        print(LIGHT_RED+"Warning: no in mpsse mode", END)
+        
+    return None
+    
 # a buffer, to keep data until a command is complete
 bulk_out_buffer = None
 truncated_data = False
 
 def parse_line(line):
-    global bulk_out_buffer, truncated_data
+    global bulk_out_buffer, truncated_data, port_mode
 
     parts = line.split()
 
@@ -645,10 +727,7 @@ def parse_line(line):
     if addr_type[0] == 'c':
         if dir == "out" and et.lower() == "s":
             # control out
-            # print("control", line)
-
             if int(parts[5], 16) == 0x40:
-                # https://github.com/lipro/libftdi/blob/master/src/ftdi.h
                 RT = {
                     0x00: "Reset",
                     0x01: "Modem control",
@@ -668,15 +747,14 @@ def parse_line(line):
                 }
                 
                 req = int(parts[6], 16)                
-                print(CYAN+"USB Vendor request", hex(req), end=" ")
+                value = int(parts[7], 16)
+                index = int(parts[8], 16)
+                    
+                print(CYAN+"USB Vendor request", hex(req), "value:"+str(value), "index:"+str(index), end=" ")
                 if req in RT:
                     # print(line)
                     print(RT[req], end="")
 
-                    # parse some requests further
-                    value = int(parts[7], 16)
-                    index = int(parts[8], 16)
-                    
                     if req == 0x00 and value < 3:
                         print(" ->", ["Reset SIO", "Purge RX", "Purge TX"][value], end="")
                     elif req == 0x03:
@@ -686,10 +764,11 @@ def parse_line(line):
                         print(" -> latency="+str(value), end="")
                     elif req == 0x0b:
                         BM = { 0:"RESET", 1:"BITBANG", 2:"MPSSE", 4:"SYNCBB", 8:"MCU", 16:"OPTO", 32:"CBUS", 64:"SYNCFF", 128:"FT1284" }
-                        if value>>8 in BM: mode = BM[value>>8]
-                        else:              mode = hex(value>>8)
-                        print(" -> mode="+mode, "mask="+hex(value & 0xff), end="")
-
+                        if value>>8 in BM: port_mode = BM[value>>8]
+                        else:              port_mode = hex(value>>8)
+                            
+                        print(" -> mode="+port_mode, "mask="+hex(value & 0xff), end="")
+                        
                 print(END)
             
         return
@@ -708,7 +787,7 @@ def parse_line(line):
             data = None
 
         if data and dir == "in":
-            print(CYAN+"USB BULK IN", hexlimit(data, 32), END)
+            print(CYAN+hexlimit("USB EP"+str(addr_ep)+" BULK_IN", data), END)
             parse_bulk_data_in(data)
         
         if data and dir == "out":
@@ -720,7 +799,7 @@ def parse_line(line):
                 data += [0]*(length-len(data))
                 truncated_data = True
 
-            print(CYAN+"USB BULK OUT["+str(len(data))+"]: "+hexlimit(data,32)+END)
+            print(CYAN+hexlimit("USB EP"+str(addr_ep)+" BULK OUT", data)+END)
 
             # There's unused data from previous transfer(s)? Prepend it. This actually barely happens in real
             # life.
@@ -728,8 +807,7 @@ def parse_line(line):
                 data = bulk_out_buffer + data
                 bulk_out_buffer = None
 
-            while data and mpsse_cmd_is_complete(data):
-                data = parse_bulk_out(data)
+            data = parse_bulk_out(data)
 
             if data:
                 bulk_out_buffer = data
