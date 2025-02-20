@@ -14,14 +14,23 @@ as a flash adapter for FPGA boards.
 | D2     | TDO  |  I  |  17    |
 | D3     | TMS  |  O  |  19    |
 
-## Usage
+## Current state
+
+The device implements a very basic MPSSE barely sufficient to be used
+for JTAG. It has successfully been used to detect various chips in a
+JTAG border scan and to program the Efinix Trion T20 FPGA using
+[openFPGAloader](https://github.com/trabucayre/openFPGALoader).
+
+## Installation
 
 Build this using the [Pico-SDK](https://github.com/raspberrypi/pico-sdk) and
 load it onto a Raspberry Pi Pico.
 
 This uses UART0 on GPIO0+1 for debug output at 115200 bit/s.
 
-The device should afterwards show up via USB as an FT2232:
+## Usage
+
+The device should show up via USB as an FT2232:
 
 ```
 $ lsusb

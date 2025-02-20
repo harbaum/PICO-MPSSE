@@ -18,9 +18,16 @@
 #include "hardware/resets.h"      // For resetting the USB controller
 #include "pico_mpsse.h"           // Device descriptors
 
+//#define DEBUG_BULK
+//#define DEBUG_SHIFT
+
+#define FTDI_REPLY_STATUS   "\x32\x60"
+
 /* ---------------------------------------------------------------- */
 /* ----------------------------- JTAG ----------------------------- */
 /* ---------------------------------------------------------------- */
+
+#define TCK_DELAY  10
 
 // GPIO as used by Pico DirtyJtag as well
 #define GPIO_TCK 18
@@ -28,96 +35,99 @@
 #define GPIO_TDO 17
 #define GPIO_TMS 19
 
-// delay needs to be 5 at least for the esp32 to detect properly
-#define JTAG_TCK_DELAY  10
+static const uint8_t pins[] = { GPIO_TCK, GPIO_TDI, GPIO_TDO, GPIO_TMS };
+static const char *pin_names[] = { "TCK", "TDI", "TDO", "TMS" };
 
-static uint8_t jtag_reply_len = 0;
-static uint8_t jtag_reply_buffer[32];
+static void jtag_clk_hi(void) {    
+  for(int i=0;i<TCK_DELAY;i++)
+    gpio_put(GPIO_TCK, 1);
+}
 
-// send jtag clock. TODO: do exact timing/rate
-static void jtag_clk(uint16_t n) {
-  while(n--) {
-    for(char i=0;i<JTAG_TCK_DELAY;i++)
-      gpio_put(GPIO_TCK, 1);
+static void jtag_clk_lo(void) {    
+  for(int i=0;i<TCK_DELAY;i++)
+    gpio_put(GPIO_TCK, 0);    
+}
 
-    for(char i=0;i<JTAG_TCK_DELAY;i++)
-      gpio_put(GPIO_TCK, 0);
+static void jtag_gpio_init(void) {
+  for(int i=0;i<4;i++)
+    gpio_init(pins[i]);
+}
+
+static void jtag_init(uint8_t value, int8_t dir) {
+  // init JTAG GPIO based on the "Set Data Bits" MPSSE command
+
+  for(int i=0;i<4;i++) {
+    gpio_set_dir(pins[i], (dir&(1<<i))?GPIO_OUT:GPIO_IN); 
+    if(dir&(1<<i))  gpio_put(pins[i], (value&(1<<i))?1:0);
+    else            gpio_pull_up(pins[i]);
+
+    printf("D%d/%s is pin %d, %sput", i, pin_names[i], pins[i], (dir&(1<<i))?"out":"in");
+    if(dir&(1<<i)) printf(" = %d\n", (value&(1<<i))?1:0);
+    else           printf(" (pullup enabled)\n");
   }
 }
 
-static void jtag_init(void) {
-  // init JTAG GPIO
-  // this should actually be done based on the "Set Data Bits" MPSSE command
-  gpio_init(GPIO_TCK); gpio_set_dir(GPIO_TCK, GPIO_OUT); gpio_put(GPIO_TCK, 0);
-  gpio_init(GPIO_TDI); gpio_set_dir(GPIO_TDI, GPIO_OUT); gpio_put(GPIO_TDI, 0);
-  gpio_init(GPIO_TDO); gpio_set_dir(GPIO_TDO, GPIO_IN);  gpio_pull_up(GPIO_TDO);
-  gpio_init(GPIO_TMS); gpio_set_dir(GPIO_TMS, GPIO_OUT); gpio_put(GPIO_TMS, 1);
-}
-
-static void jtag_reset(void) {
-  // clock some TMS=1 to get into reset state
-  gpio_put(GPIO_TMS, 1);
-  gpio_put(GPIO_TDI, 1);
-  jtag_clk(10);
-}
-
-static void jtag_tms(uint8_t tdi, uint16_t pattern, uint8_t cnt) {
-  printf("TDI %d (%02x)\n", tdi, pattern);
+static void jtag_tms(struct jtag *jtag, uint8_t tdi, uint16_t pattern, uint8_t do_rx, uint8_t cnt) {
+  uint8_t *rx = NULL;
+  if(do_rx)
+    rx = jtag->reply_buffer + jtag->reply_len + 2;
+  
+  // printf("TDI %d (%02x)\n", tdi, pattern);
   gpio_put(GPIO_TDI, tdi);
 
-  while(cnt--) {  
-    printf("TMS %d + CLK\n", (pattern & 1)?1:0);
-    gpio_put(GPIO_TMS, (pattern & 1)?1:0);
-    pattern >>= 1;
-    jtag_clk(1);
-  }
-}
-
-static void jtag_get_tdo_bytes(uint8_t *buffer, int cnt) {
-  while(cnt--) {  
-    uint8_t byte = 0;
-    for(int b=0;b<8;b++) {
-      byte = byte >> 1;
-      if(gpio_get(GPIO_TDO)) byte |= 0x80;	
-      jtag_clk(1);
-    }
+  while(cnt--) {
+    // printf("TMS %d + CLK\n", (pattern & 1)?1:0);
+    gpio_put(GPIO_TMS, pattern & 1); pattern >>= 1;
+    jtag_clk_hi();
       
-    *buffer++ = byte;
+    if(rx) { *rx >>= 1; if(gpio_get(GPIO_TDO)) *rx |= 0x80; else *rx &= 0x7f; }
+    jtag_clk_lo();
   }
+
+  // one byte received
+  if(rx) jtag->reply_len++;
 }
 
-static void jtag_data(uint8_t *tx, uint8_t do_rx, uint16_t cnt) {
-  uint8_t *rx = NULL;
+// This is the optimized write-only-whole-bytes which is the main routine
+// called when downloading data onto a target. It's critical as e.g.
+// the efinix trion won't program successfully if this is too
+// slow.
+static void jtag_data_write_bytes(struct jtag *jtag, uint8_t *tx, uint16_t cnt) {
+  for(int bcnt=0;bcnt<cnt;bcnt++,tx++) {
+    gpio_put(GPIO_TDI, *tx &   1); gpio_put(GPIO_TCK, 1); gpio_put(GPIO_TCK, 0);
+    gpio_put(GPIO_TDI, *tx &   2); gpio_put(GPIO_TCK, 1); gpio_put(GPIO_TCK, 0);
+    gpio_put(GPIO_TDI, *tx &   4); gpio_put(GPIO_TCK, 1); gpio_put(GPIO_TCK, 0);
+    gpio_put(GPIO_TDI, *tx &   8); gpio_put(GPIO_TCK, 1); gpio_put(GPIO_TCK, 0);
+    gpio_put(GPIO_TDI, *tx &  16); gpio_put(GPIO_TCK, 1); gpio_put(GPIO_TCK, 0);
+    gpio_put(GPIO_TDI, *tx &  32); gpio_put(GPIO_TCK, 1); gpio_put(GPIO_TCK, 0);
+    gpio_put(GPIO_TDI, *tx &  64); gpio_put(GPIO_TCK, 1); gpio_put(GPIO_TCK, 0);    
+    gpio_put(GPIO_TDI, *tx & 128); gpio_put(GPIO_TCK, 1); gpio_put(GPIO_TCK, 0);    	
+  }
+    
+  return;
+}
 
-  // printf("DO RX=%d\n", do_rx);
-  
-  if(do_rx)
-    rx = jtag_reply_buffer + jtag_reply_len + 2;
-  
+static void jtag_data(struct jtag *jtag, uint8_t *tx, uint8_t do_rx, uint32_t cnt) {
+  uint8_t *rx = NULL;
+  if(do_rx) rx = jtag->reply_buffer + jtag->reply_len + 2;
+
   while(cnt) {
     // walk over all bits of each byte
-    for(int bit=0;bit<8 && cnt;bit++,cnt--) {
-      // printf("%d D %d -> %d\n", cnt, *tx & 1, gpio_get(GPIO_TDO));
-
-      if(tx) {
-	gpio_put(GPIO_TDO, (*tx & 1)?1:0);
-	*tx >>= 1;
-      }
-
-      if(rx) {      
-	*rx >>= 1;
-	if(gpio_get(GPIO_TDO)) *rx |= 0x80;
-      }
-	
-      jtag_clk(1);
+    for(int bit=0;(bit<8) && cnt;bit++,cnt--) {
+      if(tx) { gpio_put(GPIO_TDI, *tx & 1); *tx >>= 1; }
+      jtag_clk_hi();
+      
+      if(rx) { *rx >>= 1; if(gpio_get(GPIO_TDO)) *rx |= 0x80; else *rx &= 0x7f; }
+      jtag_clk_lo();
     }
 
     if(rx) {
       rx++;
-      jtag_reply_len++;
+      jtag->reply_len++;
     }
 
-    if(tx) tx++;
+    if(tx)
+      tx++;
   }
 }
 
@@ -151,57 +161,63 @@ static uint8_t ep0_buf[64];
 static struct usb_device_configuration dev_config = {
         .device_descriptor = &device_descriptor,
         .device_qualifier_descriptor = &device_qualifier_descriptor,
-        .interface_descriptor_1 = &interface_descriptor_1,
-        .interface_descriptor_2 = &interface_descriptor_2,
+
+	.ports[0].jtag.pending_writes = 0,
+	.ports[0].jtag.eps = { EP1_IN_ADDR, EP2_OUT_ADDR },
+	.ports[0].jtag.reply_len = 0,
+	.ports[0].jtag.tx_pending = false,
+	.ports[0].interface_descriptor = &interface_descriptor_p0,
+	.ports[0].endpoints = { {
+	    .descriptor = &ep1_in,
+	    .handler = &ep1_in_handler,
+	    .endpoint_control = &usb_dpram->ep_ctrl[0].in,
+	    .buffer_control = &usb_dpram->ep_buf_ctrl[1].in,
+	    .data_buffer = &usb_dpram->epx_data[0 * 512],
+	  }, {
+	    .descriptor = &ep2_out,
+	    .handler = &ep2_out_handler,
+	    .endpoint_control = &usb_dpram->ep_ctrl[1].out,
+	    .buffer_control = &usb_dpram->ep_buf_ctrl[2].out,
+	    .data_buffer = &usb_dpram->epx_data[1 * 512],
+	  } },
+	
+	.ports[1].jtag.pending_writes = 0,
+	.ports[1].jtag.eps = { EP3_IN_ADDR, EP4_OUT_ADDR },
+	.ports[1].jtag.reply_len = 0,
+	.ports[1].jtag.tx_pending = false,
+	.ports[1].interface_descriptor = &interface_descriptor_p1,
+	.ports[1].endpoints = { {
+	    .descriptor = &ep3_in,
+	    .handler = &ep3_in_handler,
+	    .endpoint_control = &usb_dpram->ep_ctrl[2].in,
+	    .buffer_control = &usb_dpram->ep_buf_ctrl[3].in,
+	    .data_buffer = &usb_dpram->epx_data[2 * 512],
+	  }, {
+	    .descriptor = &ep4_out,
+	    .handler = &ep4_out_handler,
+	    .endpoint_control = &usb_dpram->ep_ctrl[3].out,
+	    .buffer_control = &usb_dpram->ep_buf_ctrl[4].out,
+	    .data_buffer = &usb_dpram->epx_data[3 * 512],
+	  } },
+	
         .config_descriptor = &config_descriptor,
         .lang_descriptor = lang_descriptor,
         .descriptor_strings = descriptor_strings,
-        .endpoints = {
-                {
-                        .descriptor = &ep0_out,
-                        .handler = &ep0_out_handler,
-                        .endpoint_control = NULL, // NA for EP0
-                        .buffer_control = &usb_dpram->ep_buf_ctrl[0].out,
-                        // EP0 in and out share a data buffer
-                        .data_buffer = &usb_dpram->ep0_buf_a[0],
-                },
-                {
-                        .descriptor = &ep0_in,
-                        .handler = &ep0_in_handler,
-                        .endpoint_control = NULL, // NA for EP0,
-                        .buffer_control = &usb_dpram->ep_buf_ctrl[0].in,
-                        // EP0 in and out share a data buffer
-                        .data_buffer = &usb_dpram->ep0_buf_a[0],
-                },
-                {
-                        .descriptor = &ep1_in,
-                        .handler = &ep1_in_handler,
-                        // EP1 starts at offset 0 for endpoint control
-                        .endpoint_control = &usb_dpram->ep_ctrl[0].in,
-                        .buffer_control = &usb_dpram->ep_buf_ctrl[1].in,
-                        .data_buffer = &usb_dpram->epx_data[0 * 512],
-                },
-                {
-                        .descriptor = &ep2_out,
-                        .handler = &ep2_out_handler,
-                        .endpoint_control = &usb_dpram->ep_ctrl[1].out,
-                        .buffer_control = &usb_dpram->ep_buf_ctrl[2].out,
-                        .data_buffer = &usb_dpram->epx_data[1 * 512],
-                },
-                {
-                        .descriptor = &ep3_in,
-                        .handler = &ep3_in_handler,
-                        .endpoint_control = &usb_dpram->ep_ctrl[2].in,
-                        .buffer_control = &usb_dpram->ep_buf_ctrl[3].in,
-                        .data_buffer = &usb_dpram->epx_data[2 * 512],
-                },
-                {
-                        .descriptor = &ep4_out,
-                        .handler = &ep4_out_handler,
-                        .endpoint_control = &usb_dpram->ep_ctrl[3].out,
-                        .buffer_control = &usb_dpram->ep_buf_ctrl[4].out,
-                        .data_buffer = &usb_dpram->epx_data[3 * 512],
-                }
+        .endpoints = { {
+	    .descriptor = &ep0_out,
+	    .handler = &ep0_out_handler,
+	    .endpoint_control = NULL, // NA for EP0
+	    .buffer_control = &usb_dpram->ep_buf_ctrl[0].out,
+	    // EP0 in and out share a data buffer
+	    .data_buffer = &usb_dpram->ep0_buf_a[0],
+	  }, {
+	    .descriptor = &ep0_in,
+	    .handler = &ep0_in_handler,
+	    .endpoint_control = NULL, // NA for EP0,
+	    .buffer_control = &usb_dpram->ep_buf_ctrl[0].in,
+	    // EP0 in and out share a data buffer
+	    .data_buffer = &usb_dpram->ep0_buf_a[0],
+	  }
         }
 };
 
@@ -213,10 +229,15 @@ static struct usb_device_configuration dev_config = {
  * @return struct usb_endpoint_configuration*
  */
 struct usb_endpoint_configuration *usb_get_endpoint_configuration(uint8_t addr) {
-    struct usb_endpoint_configuration *endpoints = dev_config.endpoints;
-    for (int i = 0; i < USB_NUM_ENDPOINTS; i++)
-        if (endpoints[i].descriptor && (endpoints[i].descriptor->bEndpointAddress == addr))
-            return &endpoints[i];
+    // search the two control endpoints and both of the two ports endpoints
+    for (int i = 0; i < 2; i++) {
+      if ( dev_config.endpoints[i].descriptor->bEndpointAddress == addr)
+	return &dev_config.endpoints[i];
+      for (uint p = 0; p < 2; p++) {
+	if ( dev_config.ports[p].endpoints[i].descriptor->bEndpointAddress == addr)
+	  return &dev_config.ports[p].endpoints[i];
+      }
+    }
 
     return NULL;
 }
@@ -233,7 +254,8 @@ uint8_t usb_prepare_string_descriptor(const unsigned char *str) {
     uint8_t bLength;
     volatile uint8_t *buf = &ep0_buf[0];
       
-    if(str) {  
+    if(str) {
+      // ordinary string taken from flash
       bLength = 2 + (strlen((const char *)str) * 2);
       *buf++ = bLength;
       *buf++ = bDescriptorType;
@@ -245,6 +267,7 @@ uint8_t usb_prepare_string_descriptor(const unsigned char *str) {
         *buf++ = 0;
       } while (c != '\0');
     } else {
+      // serial number
       pico_get_unique_board_id_string(&ep0_buf[0]+2, 64);
       bLength = strlen(&ep0_buf[0]+2);
       
@@ -298,11 +321,10 @@ void usb_setup_endpoint(const struct usb_endpoint_configuration *ep) {
  *
  */
 void usb_setup_endpoints() {
-    const struct usb_endpoint_configuration *endpoints = dev_config.endpoints;
-    for (int i = 0; i < USB_NUM_ENDPOINTS; i++) {
-        if (endpoints[i].descriptor && endpoints[i].handler) {
-            usb_setup_endpoint(&endpoints[i]);
-        }
+    for (int i = 0; i < 2; i++) {
+      usb_setup_endpoint(&dev_config.endpoints[i]);
+      for (uint p = 0; p < 2; p++) 
+	usb_setup_endpoint(&dev_config.ports[p].endpoints[i]);
     }
 }
 
@@ -370,7 +392,7 @@ void usb_start_transfer(struct usb_endpoint_configuration *ep, uint8_t *buf, uin
     // For multi packet transfers see the tinyusb port.
     assert(len <= 64);
 
-    printf("Start transfer of len %d on ep addr 0x%x\n", len, ep->descriptor->bEndpointAddress);
+    // printf("Start transfer of len %d on ep addr 0x%x\n", len, ep->descriptor->bEndpointAddress);
 
     // Prepare buffer control register value
     uint32_t val = len | USB_BUF_CTRL_AVAIL;
@@ -426,23 +448,15 @@ void usb_handle_config_descriptor(volatile struct usb_setup_packet *pkt) {
 
     // If we more than just the config descriptor copy it all
     if (pkt->wLength >= d->wTotalLength) {
-        const struct usb_endpoint_configuration *ep = dev_config.endpoints;
-
-	// send first interface desciptor using endpoints 1 and 2
-        memcpy((void *) buf, dev_config.interface_descriptor_1, sizeof(struct usb_interface_descriptor));
+      for (uint p = 0; p < 2; p++) {
+	// send both ports interface desciptors with both endpoints each
+        memcpy((void *) buf, dev_config.ports[p].interface_descriptor, sizeof(struct usb_interface_descriptor));
         buf += sizeof(struct usb_interface_descriptor);
-	memcpy((void *) buf, ep[2].descriptor, sizeof(struct usb_endpoint_descriptor));
+	memcpy((void *) buf, dev_config.ports[p].endpoints[0].descriptor, sizeof(struct usb_endpoint_descriptor));
 	buf += sizeof(struct usb_endpoint_descriptor);
-	memcpy((void *) buf, ep[3].descriptor, sizeof(struct usb_endpoint_descriptor));
+	memcpy((void *) buf, dev_config.ports[p].endpoints[1].descriptor, sizeof(struct usb_endpoint_descriptor));
 	buf += sizeof(struct usb_endpoint_descriptor);
-	
-	// send second interface desciptor using endpoints 3 and 4
-        memcpy((void *) buf, dev_config.interface_descriptor_2, sizeof(struct usb_interface_descriptor));
-        buf += sizeof(struct usb_interface_descriptor);
-	memcpy((void *) buf, ep[4].descriptor, sizeof(struct usb_endpoint_descriptor));
-	buf += sizeof(struct usb_endpoint_descriptor);
-	memcpy((void *) buf, ep[5].descriptor, sizeof(struct usb_endpoint_descriptor));
-	buf += sizeof(struct usb_endpoint_descriptor);	
+      }
     }
 
     // Send data
@@ -484,13 +498,6 @@ void usb_handle_string_descriptor(volatile struct usb_setup_packet *pkt) {
 }
 
 /**
- * @brief Sends a zero length status packet back to the host.
- */
-void usb_acknowledge_out_request(void) {
-    usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
-}
-
-/**
  * @brief Handles a SET_ADDR request from the host. The actual setting of the device address in
  * hardware is done in ep0_in_handler. This is because we have to acknowledge the request first
  * as a device with address zero.
@@ -504,7 +511,7 @@ void usb_set_device_address(volatile struct usb_setup_packet *pkt) {
     printf("Set address %d\r\n", dev_addr);
     // Will set address in the callback phase
     should_set_address = true;
-    usb_acknowledge_out_request();
+    usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
 }
 
 /**
@@ -516,7 +523,7 @@ void usb_set_device_address(volatile struct usb_setup_packet *pkt) {
 void usb_set_device_configuration(__unused volatile struct usb_setup_packet *pkt) {
     // Only one configuration so just acknowledge the request
     printf("Device Enumerated\r\n");
-    usb_acknowledge_out_request();
+    usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
     configured = true;
 }
 
@@ -533,6 +540,8 @@ void usb_handle_status_request(volatile struct usb_setup_packet *pkt) {
  * @brief Respond to a setup packet from the host.
  *
  */
+static void check_for_outgoing_data(struct jtag *jtag);
+
 void usb_handle_setup_packet(void) {
     volatile struct usb_setup_packet *pkt = (volatile struct usb_setup_packet *) &usb_dpram->setup_packet;
     uint8_t req_direction = pkt->bmRequestType;
@@ -547,7 +556,7 @@ void usb_handle_setup_packet(void) {
         } else if (req == USB_REQUEST_SET_CONFIGURATION) {
             usb_set_device_configuration(pkt);
         } else {
-            usb_acknowledge_out_request();
+	    usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
             printf("Other OUT request (0x%x)\r\n", pkt->bRequest);
         }
     } else if (req_direction == USB_DIR_IN) {
@@ -555,9 +564,7 @@ void usb_handle_setup_packet(void) {
 	  usb_handle_status_request(pkt);
 	  
         } else if (req == USB_REQUEST_GET_DESCRIPTOR) {
-            uint16_t descriptor_type = pkt->wValue >> 8;
-
-            switch (descriptor_type) {
+            switch (pkt->wValue >> 8) {
                 case USB_DT_DEVICE:
                     usb_handle_device_descriptor(pkt);
                     printf("GET DEVICE DESCRIPTOR\r\n");
@@ -579,32 +586,38 @@ void usb_handle_setup_packet(void) {
 		    break;
 
                 default:
-                    printf("Unhandled GET_DESCRIPTOR type 0x%x\r\n", descriptor_type);
-		    usb_acknowledge_out_request();
+		    usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
+                    printf("Unhandled GET_DESCRIPTOR type 0x%x\r\n", pkt->wValue >> 8);
             }
         } else {
             printf("Other IN request (0x%x)\r\n", pkt->bRequest);
         }
     }
     else if (req_direction == 0x40) {
-      printf("VENDOR OUT %02x\n", pkt->bRequest);
 
       switch(pkt->bRequest) {
-      case 0:
+      case 0x00:
 	printf("FTDI RESET\n");
-	usb_start_transfer(usb_get_endpoint_configuration(EP1_IN_ADDR), "\x02\x60", 2);    
 	break;
 
-      case 3:
+      case 0x03:
 	printf("FTDI SET BAUD RATE\n");
 	break;
 
+      case 0x05:
+	printf("FTDI SET LATENCY TIMER\n");
+	break;
+
+      case 0x0b:
+	printf("FTDI SET BITMODE\n");
+	break;
+
       default:
-	printf("Unsupported vendor request\n");
+	printf("Unsupported vendor request %02x\n", pkt->bRequest);
 	break;
 	
       }
-      usb_acknowledge_out_request();
+      usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
     }
     else if (req_direction == 0xc0) {
       printf("VENDOR IN %02x\n", pkt->bRequest);
@@ -636,17 +649,23 @@ static void usb_handle_ep_buff_done(struct usb_endpoint_configuration *ep) {
  * @param in
  */
 static void usb_handle_buff_done(uint ep_num, bool in) {
-    uint8_t ep_addr = ep_num | (in ? USB_DIR_IN : 0);
-    printf("EP %d (in = %d) done\n", ep_num, in);
-    for (uint i = 0; i < USB_NUM_ENDPOINTS; i++) {
-        struct usb_endpoint_configuration *ep = &dev_config.endpoints[i];
-        if (ep->descriptor && ep->handler) {
-            if (ep->descriptor->bEndpointAddress == ep_addr) {
-                usb_handle_ep_buff_done(ep);
-                return;
-            }
-        }
+  uint8_t ep_addr = ep_num | (in ? USB_DIR_IN : 0);
+  // printf("EP %d (in = %d) done\n", ep_num, in);
+
+  for (uint i = 0; i < 2; i++) {
+    // check the two control endpoints
+    if (dev_config.endpoints[i].descriptor->bEndpointAddress == ep_addr) {
+      usb_handle_ep_buff_done(&dev_config.endpoints[i]);
+      return;
     }
+    // and both endpoints of both ports
+    for (uint p = 0; p < 2; p++) {
+      if (dev_config.ports[p].endpoints[i].descriptor->bEndpointAddress == ep_addr) {
+	usb_handle_ep_buff_done(&dev_config.ports[p].endpoints[i]);
+	return;
+      }
+    }
+  }
 }
 
 /**
@@ -732,7 +751,7 @@ void ep0_in_handler(__unused uint8_t *buf, __unused uint16_t len) {
         usb_start_transfer(ep, NULL, 0);
     }
 
-    printf("EP0 IN\n");  
+    // printf("EP0 IN\n");  
 }
 
 static void hexdump(void *data, int size) {
@@ -758,26 +777,19 @@ static void hexdump(void *data, int size) {
 }
 
 void ep0_out_handler(__unused uint8_t *buf, __unused uint16_t len) {
-  printf("EP0 OUT\n");  
+  // printf("EP0 OUT\n");  
 }
 
-// Device specific functions
-void ep1_in_handler(__unused uint8_t *buf, uint16_t len) {
-    printf("EP1 >>>>>>>>>> Sent %d bytes to host\n", len);
-    hexdump(buf, len);
-    
-    // re-enable reading
-    struct usb_endpoint_configuration *ep = usb_get_endpoint_configuration(EP1_IN_ADDR);
-    usb_start_transfer(ep, NULL, 0);    
-}
-
-static uint16_t mpsse_cmd_parse(uint8_t *buf, uint16_t len) {
+static uint16_t mpsse_cmd_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
 
   switch(buf[0]) {
   case 0x80:
   case 0x82:
     if(len < 3) return 0;  // needs at least 3 bytes    
     printf("MPSSE: Set data bits %s dir %02x, value %02x\n", (buf[0]&2)?"high":"low", buf[1], buf[2]);
+
+    /* we currently only support the lower bits */
+    if(!(buf[0]&2)) jtag_init(buf[1], buf[2]);
     return 3;
                 
   case 0x84:
@@ -812,125 +824,236 @@ static uint16_t mpsse_cmd_parse(uint8_t *buf, uint16_t len) {
   return 1;
 }
 
-static uint16_t mpsse_shift_parse(uint8_t *buf, uint16_t len) {
+// According to the AN 108, only six TMS opcodes actually exist.
+// These are 0x4a, 0x4b, 0x6a, 0x6b, 0x6e and 0x6f
+// 0x4a = 0b01001010
+// 0x4b = 0b01001011
+// 0x6a = 0b01101010
+// 0x6b = 0b01101011
+// 0x6e = 0b01101110
+// 0x6f = 0b01101111
+
+// BIT is always set, LSB is always set and W-TDI is never set 
+// -> no TMS byte write exists
+
+static uint16_t mpsse_shift_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
   // calculate data shift length
   uint16_t cmd_len = 0;
   uint16_t shift_len = 0;
   uint8_t cmd = buf[0];
-  
+
+  /* mpsse command bits  
+     0: W-VE
+     1: BIT
+     2: R-VE
+     3: LSB
+     4: W-TDI
+     5: R-TDO
+     6: W-TMS
+     7: 0
+  */
+
   if(cmd & 2) {
     // length is in bits, total command length is 3
-    if(len < 3) return 0;    // needs at last cmd,len,data
+    if(len < 2) return 0;    // needs at last cmd,len
     shift_len = buf[1] + 1;  // shift length was given in bits-1
-    cmd_len = 3;
-    buf += 2;
-  } else {
-    // length is given in bytes and command length is variable
-    if(len < 3) return 0;                // needs at least cmd,len16
-    shift_len = buf[1] + 256*buf[2] + 1; // shift length was given in bytes-1
-    cmd_len = 3+shift_len;
-    if(len < 3+shift_len) return 0;
-    shift_len *= 8;                      // convert shift length to bits
-    buf += 3;
+    // write TDI or TMS?
+    if(cmd & 0x50) {
+      // write bits has one additional payload byte    
+      if(len < 3) return 0;
+      cmd_len = 3;
+      buf += 2;
+    } else {
+      // read-only bits
+      cmd_len = 2;
+      buf += 1;
+    }
 
-    // TODO: when not writing, there is no extra data
+#ifdef DEBUG_SHIFT
+    printf("MPSSE: shift %d bits\n", shift_len);
+#endif
+
+    // TMS is only supported in bit mode and can thus be handled here
+    if(cmd & 0x40)
+      jtag_tms(jtag, (buf[0]&0x80)?1:0, buf[0]&0x7f, cmd & 0x20, shift_len);
+    else 
+      jtag_data(jtag, (cmd & 0x10)?buf:NULL, cmd & 0x20, shift_len);
+
+    return cmd_len;    
   }
 
-  printf("MPSSE: shift %d bits\n", shift_len);
+  // length is given in bytes and command length is variable
+  if(len < 3) return 0;                // needs at least cmd,len16
+  shift_len = buf[1] + 256*buf[2] + 1; // shift length was given in bytes-1
 
-  // shift into tms
-  if(cmd & 0x40) {
-    // TODO: this may actually read tdo    
-    jtag_tms((buf[0]&0x80)?1:0, buf[0], shift_len);
-    return cmd_len;
+  // W-TDI set?
+  if(cmd & 0x10) cmd_len = 3+shift_len;
+  else           cmd_len = 3;
+  
+#ifdef DEBUG_SHIFT
+  printf("MPSSE: shift %d bytes (%d avail)\n", shift_len, len);
+#endif
+
+  // it may happen that we are supposed to shift out more bits than we have payload
+  if((cmd & 0x10) && (3+shift_len > len)) {
+    jtag_data(jtag, buf+3, cmd & 0x20, (uint32_t)(len-3)*8);
+    jtag->pending_writes = shift_len-(len-3);
+    jtag->pending_write_cmd = cmd;
+    
+    return len;   // all consumed that was there so far
   }
 
-  // clock all bits
-  jtag_data(buf, cmd & 0x20, shift_len);
-
+  // is this a write-only command?
+  if((cmd & 0x30) == 0x10)
+    jtag_data_write_bytes(jtag, buf+3, shift_len);
+  else
+    // clock all bits
+    jtag_data(jtag, (cmd & 0x10)?(buf+3):NULL, cmd & 0x20, (uint32_t)shift_len * 8);   // shift_len is given in bytes
+  
   return cmd_len;
 }
   
-static uint16_t mpsse_parse(uint8_t *buf, uint16_t len) {
+static uint16_t mpsse_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
   if(!len) return 0;  // nothing parsed as there was nothing to parse
 
   if(buf[0] & 0x80)
-    return mpsse_cmd_parse(buf, len);
+    return mpsse_cmd_parse(jtag, buf, len);
 
-  return mpsse_shift_parse(buf, len);
+  return mpsse_shift_parse(jtag, buf, len);
+}
+
+static void check_for_outgoing_data(struct jtag *jtag) {
+  if(jtag->tx_pending) return;
+  
+  // check if there's now data in the reply buffer and request to return it
+  if(jtag->reply_len) {
+    printf("REPLY: %d\n", jtag->reply_len);
+    hexdump(jtag->reply_buffer+2, jtag->reply_len);
+    
+    // data is always stored from byte 2 on in the reply buffer, so that the
+    // ftdi status can be placed in front
+    memcpy(jtag->reply_buffer, FTDI_REPLY_STATUS, 2);
+
+    // as a full speed device we can return max 62 bytes per USB transfer
+    if(jtag->reply_len > 62) {
+      usb_start_transfer(usb_get_endpoint_configuration(jtag->eps[0]), jtag->reply_buffer, 64);
+      // shift data down
+      memmove(jtag->reply_buffer, jtag->reply_buffer+62, 194);  // reply buffer is 256 bytes
+      jtag->reply_len -= 62;
+    } else {    
+      // Send all data back to host
+      usb_start_transfer(usb_get_endpoint_configuration(jtag->eps[0]), jtag->reply_buffer, jtag->reply_len+2);
+      jtag->reply_len = 0;
+    }
+    jtag->tx_pending = true;
+  } else {
+    printf("REPLY: no pending data\n");
+    
+    usb_start_transfer(usb_get_endpoint_configuration(jtag->eps[0]), FTDI_REPLY_STATUS, 2);    
+    jtag->tx_pending = true;
+  }
+}
+
+// pending outgoing data has been sent to host
+void ep1_in_handler(__unused uint8_t *buf, uint16_t len) {
+  // EP1 handles incoming data for port 0
+  struct jtag *jtag = &dev_config.ports[0].jtag;
+  
+#ifdef DEBUG_BULK
+  printf("EP1 >>>>>>>>>> Sent %d bytes to host\n", len);
+  hexdump(buf, len);
+#endif
+  
+  jtag->tx_pending = false;
+  check_for_outgoing_data(jtag);
+}
+
+static void mpsse_parse_all(struct jtag *jtag, uint8_t *buf, uint16_t len) {
+  // check if there are remaining bytes to shift from previous request
+  if(jtag->pending_writes) {
+    uint16_t bytes2shift = (len < jtag->pending_writes)?len:jtag->pending_writes;
+    // printf("add %d\n", bytes2shift);    
+
+    jtag_data(jtag, buf,jtag->pending_write_cmd & 0x20, (uint32_t)bytes2shift*8);
+    jtag->pending_writes -= bytes2shift;
+
+    len -= bytes2shift;
+    buf += bytes2shift;
+    if(!len) return;
+  }
+  
+  int x = mpsse_parse(jtag, buf, len);
+  while(x && len) {
+    buf += x;
+    len -= x;
+    x = mpsse_parse(jtag, buf, len);
+  }
+
+  //  if(len) printf("---------------- leftover %d ----------------\n", len);
 }
 
 void ep2_out_handler(uint8_t *buf, uint16_t len) {
+  // EP2 handles outgoing data for port 0
+  struct jtag *jtag = &dev_config.ports[0].jtag;
+
+#ifdef DEBUG_BULK
   printf("EP2 >>>>>>>>>>>> RX <<<<<<<<<<<<<\n");
   hexdump(buf, len);
-
-  int x = mpsse_parse(buf, len);
-  while(x) {
-    buf += x;
-    len -= x;
-    x = mpsse_parse(buf, len);
-  }
-
-  printf("JTAG: reply len now %d\n", jtag_reply_len);
+#endif
   
-  // check if there's now data in the reply buffer and request to return it
-  if(jtag_reply_len) {  
-    hexdump(jtag_reply_buffer+2, jtag_reply_len);
-
-    // data is always stored from byte 2 on in the reply buffer, so that the
-    // ftdi status can be placed in front
-    jtag_reply_buffer[0] = 0x02;
-    jtag_reply_buffer[1] = 0x60;
+  mpsse_parse_all(jtag, buf, len);
   
-    // Send data back to host
-    struct usb_endpoint_configuration *ep = usb_get_endpoint_configuration(EP1_IN_ADDR);
-    usb_start_transfer(ep, jtag_reply_buffer, jtag_reply_len+2);
-    jtag_reply_len = 0;
-  }
-    
   // re-enable receiver
   usb_start_transfer(usb_get_endpoint_configuration(EP2_OUT_ADDR), NULL, 64);
 }
 
 void ep3_in_handler(__unused uint8_t *buf, uint16_t len) {
-    printf("EP3 *** Sent %d bytes to host\n", len);
+  // EP3 handles incoming data for port 1
+  struct jtag *jtag = &dev_config.ports[1].jtag;
+
+#ifdef DEBUG_BULK
+  printf("EP3 >>>>>>>>>> Sent %d bytes to host\n", len);
+  hexdump(buf, len);
+#endif
+  
+  jtag->tx_pending = false;
+  check_for_outgoing_data(jtag);
 }
 
 void ep4_out_handler(uint8_t *buf, uint16_t len) {
-    printf("EP4 *** RX %d bytes from host\n", len);
+  // EP4 handles outgoing data for port 1
+  struct jtag *jtag = &dev_config.ports[1].jtag;
+
+#ifdef DEBUG_BULK
+  printf("EP4 >>>>>>>>>>>> RX <<<<<<<<<<<<<\n");
+  hexdump(buf, len);
+#endif
+  
+  mpsse_parse_all(jtag, buf, len);
+  
+  // re-enable receiver
+  usb_start_transfer(usb_get_endpoint_configuration(EP4_OUT_ADDR), NULL, 64);
 }
 
 int main(void) {
     stdio_init_all();
     printf("<<<<<<<<<<<<<<<<< Pico MPSSE >>>>>>>>>>>>>>>>>>\n");
     usb_device_init();
-
-    jtag_init();
-
-#if 0
-    jtag_reset();
-
-    // progress into SHIFT DR state, lsb first
-    jtag_tms(1, 0b0010, 4);
-
-    // and clock some data in
-    // ESP32 should return = e5 34 00 12
-    char buffer[4];
-    jtag_get_tdo_bytes(buffer, 4);
-    hexdump(buffer, 4);
-#endif
+    jtag_gpio_init();
     
     // Wait until configured
-    while (!configured) {
+    while(!configured)
         tight_loop_contents();
-    }
 
+    // get ready to tx to host
+    check_for_outgoing_data(&dev_config.ports[0].jtag);
+    check_for_outgoing_data(&dev_config.ports[1].jtag);
+	
     // Get ready to rx from host
     usb_start_transfer(usb_get_endpoint_configuration(EP2_OUT_ADDR), NULL, 64);
-    // usb_start_transfer(usb_get_endpoint_configuration(EP4_OUT_ADDR), NULL, 64);
+    usb_start_transfer(usb_get_endpoint_configuration(EP4_OUT_ADDR), NULL, 64);
 
     // Everything is interrupt driven so just loop here
-    while (1) {
+    while(1)
         tight_loop_contents();
-    }
 }

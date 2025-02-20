@@ -28,17 +28,32 @@ struct usb_endpoint_configuration {
 
 // TODO: cleanup the interfaces
 
+struct jtag {
+  bool tx_pending;
+  uint8_t reply_len;
+  uint8_t reply_buffer[256];
+  uint8_t eps[2];
+  uint16_t pending_writes;
+  uint8_t pending_write_cmd;
+};
+
 // Struct in which we keep the device configuration
 struct usb_device_configuration {
-    const struct usb_device_descriptor *device_descriptor;
-    const struct usb_interface_descriptor *interface_descriptor_1;
-    const struct usb_interface_descriptor *interface_descriptor_2;
-    const struct usb_configuration_descriptor *config_descriptor;
-    const struct usb_device_qualifier_descriptor *device_qualifier_descriptor;
-    const unsigned char *lang_descriptor;
-    const unsigned char **descriptor_strings;
-    // USB num endpoints is 16
-    struct usb_endpoint_configuration endpoints[USB_NUM_ENDPOINTS];
+  const struct usb_device_descriptor *device_descriptor;
+  
+  // device has two ports each 
+  struct {
+    const struct usb_interface_descriptor *interface_descriptor;
+    struct usb_endpoint_configuration endpoints[2];
+
+    struct jtag jtag;
+  } ports[2];
+  
+  const struct usb_configuration_descriptor *config_descriptor;
+  const struct usb_device_qualifier_descriptor *device_qualifier_descriptor;
+  const unsigned char *lang_descriptor;
+  const unsigned char **descriptor_strings;
+  struct usb_endpoint_configuration endpoints[2];
 };
 
 #define EP0_IN_ADDR  (USB_DIR_IN  | 0)
@@ -97,22 +112,10 @@ static const struct usb_device_qualifier_descriptor device_qualifier_descriptor 
 	.bRESERVED       = 0
 };
 
-static const struct usb_interface_descriptor interface_descriptor_1 = {
+static const struct usb_interface_descriptor interface_descriptor_p0 = {
         .bLength            = sizeof(struct usb_interface_descriptor),
         .bDescriptorType    = USB_DT_INTERFACE,
         .bInterfaceNumber   = 0,
-        .bAlternateSetting  = 0,
-        .bNumEndpoints      = 2,    // Interface has 2 endpoints
-        .bInterfaceClass    = 0xff, // Vendor specific endpoint
-        .bInterfaceSubClass = 0xff,
-        .bInterfaceProtocol = 0xff,
-        .iInterface         = 2
-};
-
-static const struct usb_interface_descriptor interface_descriptor_2 = {
-        .bLength            = sizeof(struct usb_interface_descriptor),
-        .bDescriptorType    = USB_DT_INTERFACE,
-        .bInterfaceNumber   = 1,
         .bAlternateSetting  = 0,
         .bNumEndpoints      = 2,    // Interface has 2 endpoints
         .bInterfaceClass    = 0xff, // Vendor specific endpoint
@@ -139,6 +142,18 @@ static const struct usb_endpoint_descriptor ep2_out = {
         .bInterval        = 0
 };
 
+static const struct usb_interface_descriptor interface_descriptor_p1 = {
+        .bLength            = sizeof(struct usb_interface_descriptor),
+        .bDescriptorType    = USB_DT_INTERFACE,
+        .bInterfaceNumber   = 1,
+        .bAlternateSetting  = 0,
+        .bNumEndpoints      = 2,    // Interface has 2 endpoints
+        .bInterfaceClass    = 0xff, // Vendor specific endpoint
+        .bInterfaceSubClass = 0xff,
+        .bInterfaceProtocol = 0xff,
+        .iInterface         = 2
+};
+
 static const struct usb_endpoint_descriptor ep3_in = {
         .bLength          = sizeof(struct usb_endpoint_descriptor),
         .bDescriptorType  = USB_DT_ENDPOINT,
@@ -161,12 +176,10 @@ static const struct usb_configuration_descriptor config_descriptor = {
         .bLength         = sizeof(struct usb_configuration_descriptor),
         .bDescriptorType = USB_DT_CONFIG,
         .wTotalLength    = (sizeof(config_descriptor) +
-                            sizeof(interface_descriptor_1) +
-                            sizeof(interface_descriptor_2) +
-                            sizeof(ep1_in) +
-			    sizeof(ep2_out) +
-                            sizeof(ep3_in) +
-                            sizeof(ep4_out)),
+                            sizeof(interface_descriptor_p0) +
+                            sizeof(ep1_in) + sizeof(ep2_out) +
+                            sizeof(interface_descriptor_p1) +
+                            sizeof(ep3_in) + sizeof(ep4_out)),
         .bNumInterfaces  = 2,
         .bConfigurationValue = 1, // Configuration 1
         .iConfiguration = 0,      // No string

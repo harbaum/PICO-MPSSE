@@ -75,7 +75,7 @@ def hexlimit(title, data, maxlen=32):
     else: retval = ""
     
     if len(data) <= maxlen: retval += ' '.join(format(x, '02x') for x in data)
-    else:                   retval +=  ' '.join(format(x, '02x') for x in data[:maxlen]) + " ..."
+    else:                   retval += ' '.join(format(x, '02x') for x in data[:maxlen]) + " ..."
     return retval
     
 # JTAG instructions as used by the different FPGA vendors
@@ -87,7 +87,8 @@ INSTRUCTIONS = {
         0x3c: "RELOAD", 0x41: "STATUS REGISTER" },
     "efinix": {
         0x02: "SAMPLE PRELOAD", 0x00: "EXTEST", 0x0f: "BYPASS", 0x03: "IDCODE",
-        0x04: "PROGRAM", 0x07: "ENTERUSER", 0x08: "USER1" }
+        0x04: "PROGRAM", 0x07: "ENTERUSER", 0x08: "USER1", 0x09: "USER2",
+        0x0a: "USER3", 0x0b: "USER4" }
 }
 
 # JTAG states
@@ -159,7 +160,7 @@ def parse_id_code(data):
     global device
     
     if len(data) < 4:
-        print("JTAG: unexpected IDCODE length")
+        print(LIGHT_RED + "JTAG: unexpected IDCODE length", len(data), END)
     else:
         idcode = int.from_bytes(bytes(data), byteorder='little', signed=False)
         idcode &= 0xefffffff  # mask last bit transmitted
@@ -198,12 +199,44 @@ def gowin_status_parse(status):
         17: "FLASH_LOCK"
     }
     
-    print("GOWIN: status", hex(status), end="=")
+    print(LIGHT_PURPLE + "GOWIN: status", hex(status), end="=")
     status_list = []
     for i in reversed(range(20)):
         if i in GOWIN_STATUS_BITS and status & (1<<i):
             status_list.append(GOWIN_STATUS_BITS[i])
-    print(",".join(status_list))
+    print(",".join(status_list) + END)
+
+def efinix_sample_preload_parse(data):
+    # reverse all bytes (due to lsb first transmission)
+    for i in range(len(data)):
+        byte = data[i]
+        byte = ((byte & 0x55) << 1) | ((byte & 0xaa) >> 1)
+        byte = ((byte & 0x33) << 2) | ((byte & 0xcc) >> 2)
+        byte = ((byte & 0x0f) << 4) | ((byte & 0xf0) >> 4)
+        data[i] = byte
+
+    print(LIGHT_PURPLE + "Efinix: SAMPLE PRELOAD");
+
+    addr = 0
+    while(len(data)):
+        print(format(addr, '04x'), end=": ")
+        bytes2print = 16 if len(data)>16 else len(data)
+        for b in range(bytes2print):
+            print(format(data[b], '02x'), end=" ")
+        for b in range(16-bytes2print):            
+            print("   ", end="")
+
+        for b in range(bytes2print):
+            if data[b] >= 32 and data[b] < 127:
+                print(chr(data[b]), end="")
+            else:
+                print(".", end="")
+
+        print("")
+        data = data[16:]
+        addr += 16
+        
+    print(END)
     
 def data_out_parse(reply):
     global jtag
@@ -229,7 +262,9 @@ def data_out_parse(reply):
 
             elif device[0] == "efinix":
                 if jtag["ir"] == 0x03:
-                    parse_id_code(reply["data"])    
+                    parse_id_code(reply["data"])
+                if jtag["ir"] == 0x02:
+                    efinix_sample_preload_parse(reply["data"])
 
 # state needed when verifying the data we see as "program" payload with data from a reference file
 verify = { "putback": None, "index": 0, "mismatch": 0 }
@@ -400,7 +435,7 @@ def check_for_expected_data(data = []):
 
     # the shift commands
     #print(hexlimit("data", data))
-    #print("expect:", jtag["dr_return"]["expect"], "shift_cnt:", jtag["shift_cnt"], jtag["dr_return"]["length"])
+    # print("expect:", jtag["dr_return"]["expect"], "shift_cnt:", jtag["shift_cnt"], jtag["dr_return"]["length"])
 
     # in some traces we've seen the reply before the request ...
     #if not len(jtag["dr_return"]["expect"]):
@@ -413,9 +448,15 @@ def check_for_expected_data(data = []):
     # these as well.
     
     # process all data bytes
+    # print("got", len(data))
     while len(jtag["dr_return"]["expect"]) and len(data):
+        # check if there are enough data bytes left
+        bits2read = jtag["dr_return"]["expect"][0]
+        if bits2read > len(data)*8:
+            bits2read = len(data)*8
+        
         # walk over all bits
-        for b in range(jtag["dr_return"]["expect"][0]):
+        for b in range(bits2read):
             if jtag["dr_return"]["length"]&7 == 0: jtag["dr_return"]["data"].append(0)
             # copy bit
             if data[0] & (0x80>>(b&7)): jtag["dr_return"]["data"][-1] |= (0x80>>(jtag["dr_return"]["length"]&7))
@@ -423,13 +464,19 @@ def check_for_expected_data(data = []):
             if b&7 == 7: data = data[1:]
             jtag["dr_return"]["length"] += 1
 
-        # if jtag["dr_return"]["expect"][0] wasn't a multiple of 8 then there's still unused bits in the last
-        # data byte. This needs to be discarded.
-        if jtag["dr_return"]["expect"][0] & 7: data = data[1:]
+        # could the expect be satisfied?
+        if bits2read == jtag["dr_return"]["expect"][0]:
+            # if jtag["dr_return"]["expect"][0] wasn't a multiple of 8 then there's still unused bits in the last
+            # data byte. This needs to be discarded.
+            if jtag["dr_return"]["expect"][0] & 7: data = data[1:]
             
-        # expected data has been handled
-        jtag["dr_return"]["expect"] = jtag["dr_return"]["expect"][1:]
-
+            # expected data has been handled
+            jtag["dr_return"]["expect"] = jtag["dr_return"]["expect"][1:]
+            # print("all consumed!")
+        else:
+            jtag["dr_return"]["expect"][0] -= bits2read
+            # print("left", jtag["dr_return"]["expect"][0])
+            
     if len(data):
         jtag["dr_return"]["premature"].extend(data)
         
@@ -725,8 +772,11 @@ def parse_line(line):
     dir = "in" if addr_type[1] == 'i' else "out"
         
     if addr_type[0] == 'c':
+#        if dir == "in":
+#            print("Control in", line)
+            
         if dir == "out" and et.lower() == "s":
-            # control out
+            # control out. Vendor?
             if int(parts[5], 16) == 0x40:
                 RT = {
                     0x00: "Reset",
@@ -816,12 +866,13 @@ def parse_line(line):
 with open(FILE, "r") as f:
     for line in f:
         line = line.strip()
-        try:
-            parse_line(line)
-        except Exception as e:
-            print("While parsing", line)
-            print("Exception:", e)
-            sys.exit(-1)
+        parse_line(line)
+#        try:
+#            parse_line(line)
+#        except Exception as e:
+#            print("While parsing", line)
+#            print("Exception:", e)
+#            sys.exit(-1)
 
 if option_prog_file: option_prog_file.close()
 
