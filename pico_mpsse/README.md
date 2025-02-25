@@ -50,7 +50,6 @@ The openFPGAloader should be able to open and use it:
 ```
 $ openFPGAloader -b trion_t20_bga256_jtag --detect
 empty
-No cable or board specified: using direct ft2232 interface
 Jtag frequency : requested 6.00MHz   -> real 6.00MHz  
 index 0:
         idcode 0x210a79
