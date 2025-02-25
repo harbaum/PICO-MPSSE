@@ -11,10 +11,17 @@ pico_sdk_init()
 
 add_executable(${PROJECT}
         ${PROJECT}.c
+	pio_jtag.c
 )
 
-target_link_libraries(${PROJECT} PRIVATE pico_stdlib)
-target_link_libraries(${PROJECT} PRIVATE pico_unique_id)
+pico_generate_pio_header(${PROJECT} ${CMAKE_CURRENT_LIST_DIR}/jtag.pio)
+
+target_link_libraries(${PROJECT} PRIVATE
+     hardware_pio
+     hardware_dma
+     pico_stdlib
+     pico_unique_id
+)
 
 add_custom_target(flash
     COMMAND echo "Flashing ${PROJECT} ..."

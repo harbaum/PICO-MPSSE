@@ -18,118 +18,16 @@
 #include "hardware/resets.h"      // For resetting the USB controller
 #include "pico_mpsse.h"           // Device descriptors
 
-//#define DEBUG_BULK
-//#define DEBUG_SHIFT
+#include "hardware/clocks.h"      // To adjust system clock to allow for 6Mhz
+#include "pio_jtag.h"
+#include "config.h"
+
+// #define DEBUG_BULK0
+// #define DEBUG_BULK1
+// #define DEBUG_SHIFT
+// #define DEBUG_GPIO
 
 #define FTDI_REPLY_STATUS   "\x32\x60"
-
-/* ---------------------------------------------------------------- */
-/* ----------------------------- JTAG ----------------------------- */
-/* ---------------------------------------------------------------- */
-
-#define TCK_DELAY  10
-
-// GPIO as used by Pico DirtyJtag as well
-#define GPIO_TCK 18
-#define GPIO_TDI 16
-#define GPIO_TDO 17
-#define GPIO_TMS 19
-
-static const uint8_t pins[] = { GPIO_TCK, GPIO_TDI, GPIO_TDO, GPIO_TMS };
-static const char *pin_names[] = { "TCK", "TDI", "TDO", "TMS" };
-
-static void jtag_clk_hi(void) {    
-  for(int i=0;i<TCK_DELAY;i++)
-    gpio_put(GPIO_TCK, 1);
-}
-
-static void jtag_clk_lo(void) {    
-  for(int i=0;i<TCK_DELAY;i++)
-    gpio_put(GPIO_TCK, 0);    
-}
-
-static void jtag_gpio_init(void) {
-  for(int i=0;i<4;i++)
-    gpio_init(pins[i]);
-}
-
-static void jtag_init(uint8_t value, int8_t dir) {
-  // init JTAG GPIO based on the "Set Data Bits" MPSSE command
-
-  for(int i=0;i<4;i++) {
-    gpio_set_dir(pins[i], (dir&(1<<i))?GPIO_OUT:GPIO_IN); 
-    if(dir&(1<<i))  gpio_put(pins[i], (value&(1<<i))?1:0);
-    else            gpio_pull_up(pins[i]);
-
-    printf("D%d/%s is pin %d, %sput", i, pin_names[i], pins[i], (dir&(1<<i))?"out":"in");
-    if(dir&(1<<i)) printf(" = %d\n", (value&(1<<i))?1:0);
-    else           printf(" (pullup enabled)\n");
-  }
-}
-
-static void jtag_tms(struct jtag *jtag, uint8_t tdi, uint16_t pattern, uint8_t do_rx, uint8_t cnt) {
-  uint8_t *rx = NULL;
-  if(do_rx)
-    rx = jtag->reply_buffer + jtag->reply_len + 2;
-  
-  // printf("TDI %d (%02x)\n", tdi, pattern);
-  gpio_put(GPIO_TDI, tdi);
-
-  while(cnt--) {
-    // printf("TMS %d + CLK\n", (pattern & 1)?1:0);
-    gpio_put(GPIO_TMS, pattern & 1); pattern >>= 1;
-    jtag_clk_hi();
-      
-    if(rx) { *rx >>= 1; if(gpio_get(GPIO_TDO)) *rx |= 0x80; else *rx &= 0x7f; }
-    jtag_clk_lo();
-  }
-
-  // one byte received
-  if(rx) jtag->reply_len++;
-}
-
-// This is the optimized write-only-whole-bytes which is the main routine
-// called when downloading data onto a target. It's critical as e.g.
-// the efinix trion won't program successfully if this is too
-// slow.
-static void jtag_data_write_bytes(struct jtag *jtag, uint8_t *tx, uint16_t cnt) {
-  for(int bcnt=0;bcnt<cnt;bcnt++,tx++) {
-    gpio_put(GPIO_TDI, *tx &   1); gpio_put(GPIO_TCK, 1); gpio_put(GPIO_TCK, 0);
-    gpio_put(GPIO_TDI, *tx &   2); gpio_put(GPIO_TCK, 1); gpio_put(GPIO_TCK, 0);
-    gpio_put(GPIO_TDI, *tx &   4); gpio_put(GPIO_TCK, 1); gpio_put(GPIO_TCK, 0);
-    gpio_put(GPIO_TDI, *tx &   8); gpio_put(GPIO_TCK, 1); gpio_put(GPIO_TCK, 0);
-    gpio_put(GPIO_TDI, *tx &  16); gpio_put(GPIO_TCK, 1); gpio_put(GPIO_TCK, 0);
-    gpio_put(GPIO_TDI, *tx &  32); gpio_put(GPIO_TCK, 1); gpio_put(GPIO_TCK, 0);
-    gpio_put(GPIO_TDI, *tx &  64); gpio_put(GPIO_TCK, 1); gpio_put(GPIO_TCK, 0);    
-    gpio_put(GPIO_TDI, *tx & 128); gpio_put(GPIO_TCK, 1); gpio_put(GPIO_TCK, 0);    	
-  }
-    
-  return;
-}
-
-static void jtag_data(struct jtag *jtag, uint8_t *tx, uint8_t do_rx, uint32_t cnt) {
-  uint8_t *rx = NULL;
-  if(do_rx) rx = jtag->reply_buffer + jtag->reply_len + 2;
-
-  while(cnt) {
-    // walk over all bits of each byte
-    for(int bit=0;(bit<8) && cnt;bit++,cnt--) {
-      if(tx) { gpio_put(GPIO_TDI, *tx & 1); *tx >>= 1; }
-      jtag_clk_hi();
-      
-      if(rx) { *rx >>= 1; if(gpio_get(GPIO_TDO)) *rx |= 0x80; else *rx &= 0x7f; }
-      jtag_clk_lo();
-    }
-
-    if(rx) {
-      rx++;
-      jtag->reply_len++;
-    }
-
-    if(tx)
-      tx++;
-  }
-}
 
 /* ---------------------------------------------------------------- */
 /* ----------------------------- USB ------------------------------ */
@@ -157,11 +55,51 @@ static uint8_t ep0_buf[64];
 
 // USB_DPRAM_SIZE is 4096u which is sifficient for 4 512 bit endpoints
 
+#ifndef JTAG1_PIN_D4
+#define JTAG1_PIN_D4 -1
+#endif
+
+#ifndef JTAG1_PIN_D5
+#define JTAG1_PIN_D5 -1
+#endif
+
+#ifndef JTAG1_PIN_D6
+#define JTAG1_PIN_D6 -1
+#endif
+
+#ifndef JTAG1_PIN_D7
+#define JTAG1_PIN_D7 -1
+#endif
+
+#ifndef JTAG2_PIN_D4
+#define JTAG2_PIN_D4 -1
+#endif
+
+#ifndef JTAG2_PIN_D5
+#define JTAG2_PIN_D5 -1
+#endif
+
+#ifndef JTAG2_PIN_D6
+#define JTAG2_PIN_D6 -1
+#endif
+
+#ifndef JTAG2_PIN_D7
+#define JTAG2_PIN_D7 -1
+#endif
+
 // Struct defining the device configuration
 static struct usb_device_configuration dev_config = {
         .device_descriptor = &device_descriptor,
         .device_qualifier_descriptor = &device_qualifier_descriptor,
 
+	.ports[0].jtag.pio.pio = pio0,
+	.ports[0].jtag.pio.sm = 0,
+	.ports[0].jtag.pio.pin_tck = JTAG1_PIN_TCK,
+	.ports[0].jtag.pio.pin_tdi = JTAG1_PIN_TDI,
+	.ports[0].jtag.pio.pin_tdo = JTAG1_PIN_TDO,
+	.ports[0].jtag.pio.pin_tms = JTAG1_PIN_TMS,
+	.ports[0].jtag.pio.pins_upper = { JTAG1_PIN_D4, JTAG1_PIN_D5, JTAG1_PIN_D6, JTAG1_PIN_D7 },	  
+	.ports[0].jtag.pio.write_pending = false,
 	.ports[0].jtag.pending_writes = 0,
 	.ports[0].jtag.eps = { EP1_IN_ADDR, EP2_OUT_ADDR },
 	.ports[0].jtag.reply_len = 0,
@@ -181,6 +119,14 @@ static struct usb_device_configuration dev_config = {
 	    .data_buffer = &usb_dpram->epx_data[1 * 512],
 	  } },
 	
+	.ports[1].jtag.pio.pio = pio1,
+	.ports[1].jtag.pio.sm = 0,
+	.ports[1].jtag.pio.pin_tck = JTAG2_PIN_TCK,
+	.ports[1].jtag.pio.pin_tdi = JTAG2_PIN_TDI,
+	.ports[1].jtag.pio.pin_tdo = JTAG2_PIN_TDO,
+	.ports[1].jtag.pio.pin_tms = JTAG2_PIN_TMS,
+	.ports[1].jtag.pio.pins_upper = { JTAG2_PIN_D4, JTAG2_PIN_D5, JTAG2_PIN_D6, JTAG2_PIN_D7 },	  
+	.ports[1].jtag.pio.write_pending = false,
 	.ports[1].jtag.pending_writes = 0,
 	.ports[1].jtag.eps = { EP3_IN_ADDR, EP4_OUT_ADDR },
 	.ports[1].jtag.reply_len = 0,
@@ -597,25 +543,49 @@ void usb_handle_setup_packet(void) {
 
       switch(pkt->bRequest) {
       case 0x00:
-	printf("FTDI RESET\n");
+	printf("FTDI RESET, #%d=%d\n", pkt->wIndex, pkt->wValue);
 	break;
 
       case 0x03:
-	printf("FTDI SET BAUD RATE\n");
+	printf("FTDI SET BAUD RATE, #%d=%d\n", pkt->wIndex, pkt->wValue);
 	break;
 
       case 0x05:
-	printf("FTDI SET LATENCY TIMER\n");
+	printf("FTDI POLL MODEM STATUS, #%d=0x%02x\n", pkt->wIndex, pkt->wValue);
+	break;
+
+      case 0x09:
+	printf("FTDI SET LATENCY TIMER, #%d=%d\n", pkt->wIndex, pkt->wValue);
 	break;
 
       case 0x0b:
-	printf("FTDI SET BITMODE\n");
+	printf("FTDI SET BITMODE, #%d=0x%02x\n", pkt->wIndex, pkt->wValue);
+	if(pkt->wIndex >= 1 && pkt->wIndex <= 2) {
+	  struct jtag *jtag = &dev_config.ports[pkt->wIndex-1].jtag;
+	  
+	  jtag->mode = pkt->wValue>>8;
+
+	  // in bitbang mode setup the direction of the upper four bits
+	  jtag->gpio_dir = (pkt->wValue>>4)&0x0f;
+	    
+	  for(int i=0;i<4;i++) {
+	    if(jtag->pio.pins_upper[i]) {
+#ifdef DEBUG_GPIO
+	      printf("  GPIO %d:", jtag->pio.pins_upper[i]);
+#endif	  
+	      gpio_put(jtag->pio.pins_upper[i], 0);  // TODO: Check why this is needed. Otherwise FPGA won't boot
+	      gpio_set_dir(jtag->pio.pins_upper[i], (jtag->gpio_dir&(1<<i))?GPIO_OUT:GPIO_IN);
+#ifdef DEBUG_GPIO
+	      printf(" %s\n", (jtag->gpio_dir&(1<<i))?"output":"input");
+#endif
+	    }
+	  }	  
+	}
 	break;
 
       default:
-	printf("Unsupported vendor request %02x\n", pkt->bRequest);
-	break;
-	
+	printf("Unsupported vendor request %02x, #%d=%d\n", pkt->bRequest, pkt->wIndex, pkt->wValue);
+	break;	
       }
       usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
     }
@@ -754,7 +724,7 @@ void ep0_in_handler(__unused uint8_t *buf, __unused uint16_t len) {
     // printf("EP0 IN\n");  
 }
 
-static void hexdump(void *data, int size) {
+void hexdump(void *data, int size) {
   int i, b2c;
   int n=0;
   char *ptr = (char*)data;
@@ -785,11 +755,39 @@ static uint16_t mpsse_cmd_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
   switch(buf[0]) {
   case 0x80:
   case 0x82:
-    if(len < 3) return 0;  // needs at least 3 bytes    
-    printf("MPSSE: Set data bits %s dir %02x, value %02x\n", (buf[0]&2)?"high":"low", buf[1], buf[2]);
-
+    if(len < 3) return 0;  // needs at least 3 bytes
+    printf("MPSSE: Set data bits %s value %02x, dir %02x\n", (buf[0]&2)?"high":"low", buf[1], buf[2]);
+    
     /* we currently only support the lower bits */
-    if(!(buf[0]&2)) jtag_init(buf[1], buf[2]);
+    if(!(buf[0]&2)) {
+      // second payload byte is direction. Lowest bits 0x0b is JTAG mapping
+      jtag_enable(&jtag->pio, (buf[2] & 0x0f) == 0x0b);
+
+      // handle upper gpio if present
+      for(int i=0;i<4;i++) {
+	if(jtag->pio.pins_upper[i]) {
+#ifdef DEBUG_GPIO
+	  printf("  GPIO %d:", jtag->pio.pins_upper[i]);
+#endif	  
+	  gpio_put(jtag->pio.pins_upper[i], 0);  // TODO: Check why this is needed. Otherwise FPGA won't boot
+	  gpio_set_dir(jtag->pio.pins_upper[i], (buf[2]&(1<<(i+4)))?GPIO_OUT:GPIO_IN);
+#ifdef DEBUG_GPIO
+	  printf(" %s", (buf[2]&(1<<(i+4)))?"output":"input");
+#endif	  
+
+	  // set value id pin is configured as output
+	  if(buf[2]&(1<<(i+4))) {
+	    gpio_put(jtag->pio.pins_upper[i], (buf[1]&(1<<(i+4)))?1:0);
+#ifdef DEBUG_GPIO
+	    printf(" = %d\n", (buf[1]&(1<<(i+4)))?1:0);	    
+#endif	  
+	  }
+#ifdef DEBUG_GPIO
+	  else printf("\n");
+#endif	  
+	}
+      }
+    }
     return 3;
                 
   case 0x84:
@@ -805,11 +803,12 @@ static uint16_t mpsse_cmd_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
     int divisor = buf[1] + 256*buf[2];
     int rate = 12000000 / ((1+divisor) * 2);
     printf("MPSSE: Set TCK/SK Divisor to %d = %d Mhz\n", divisor, rate/1000000);
+    jtag_set_clk_freq(&jtag->pio, rate/1000);    
     return 3;
   }
 
   case 0x87:
-    printf("MPSSE: Flush\n");
+    // printf("MPSSE: Flush\n");
     return 1;
 
   case 0x8a:
@@ -842,6 +841,8 @@ static uint16_t mpsse_shift_parse(struct jtag *jtag, uint8_t *buf, uint16_t len)
   uint16_t shift_len = 0;
   uint8_t cmd = buf[0];
 
+  // printf("CMD "); hexdump(buf, len);
+  
   /* mpsse command bits  
      0: W-VE
      1: BIT
@@ -873,12 +874,20 @@ static uint16_t mpsse_shift_parse(struct jtag *jtag, uint8_t *buf, uint16_t len)
     printf("MPSSE: shift %d bits\n", shift_len);
 #endif
 
-    // TMS is only supported in bit mode and can thus be handled here
-    if(cmd & 0x40)
-      jtag_tms(jtag, (buf[0]&0x80)?1:0, buf[0]&0x7f, cmd & 0x20, shift_len);
-    else 
-      jtag_data(jtag, (cmd & 0x10)?buf:NULL, cmd & 0x20, shift_len);
+    // new PIO code
+    if(cmd & 0x40) {
+      // printf("JTAG TMS BIT WRITE %d ", shift_len); hexdump(buf, 1);
+      jtag_write_tms(&jtag->pio, (buf[0]&0x80)?1:0, buf,
+		     (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL, shift_len);
+      if(cmd & 0x20) jtag->reply_len += (shift_len+7)/8;
 
+    } else {
+      // printf("JTAG TDI BIT WRITE %d ", shift_len); hexdump(buf, 1);
+      jtag_write_tdi_read_tdo(&jtag->pio, (cmd & 0x10)?buf:NULL,
+			      (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL, shift_len);
+      if(cmd & 0x20) jtag->reply_len += (shift_len+7)/8;
+    }
+    
     return cmd_len;    
   }
 
@@ -896,20 +905,20 @@ static uint16_t mpsse_shift_parse(struct jtag *jtag, uint8_t *buf, uint16_t len)
 
   // it may happen that we are supposed to shift out more bits than we have payload
   if((cmd & 0x10) && (3+shift_len > len)) {
-    jtag_data(jtag, buf+3, cmd & 0x20, (uint32_t)(len-3)*8);
+    // printf("---------------------> truncating write %d to %d\n", shift_len, len-3);
+
+    jtag_write_tdi_read_tdo(&jtag->pio, buf+3,
+	    (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL,(len-3)*8);
+    if(cmd & 0x20) jtag->reply_len += (len-3);
     jtag->pending_writes = shift_len-(len-3);
     jtag->pending_write_cmd = cmd;
     
     return len;   // all consumed that was there so far
   }
 
-  // is this a write-only command?
-  if((cmd & 0x30) == 0x10)
-    jtag_data_write_bytes(jtag, buf+3, shift_len);
-  else
-    // clock all bits
-    jtag_data(jtag, (cmd & 0x10)?(buf+3):NULL, cmd & 0x20, (uint32_t)shift_len * 8);   // shift_len is given in bytes
-  
+  jtag_write_tdi_read_tdo(&jtag->pio, (cmd & 0x10)?(buf+3):NULL,
+			  (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL, shift_len*8);
+  if(cmd & 0x20) jtag->reply_len += shift_len;
   return cmd_len;
 }
   
@@ -927,8 +936,8 @@ static void check_for_outgoing_data(struct jtag *jtag) {
   
   // check if there's now data in the reply buffer and request to return it
   if(jtag->reply_len) {
-    printf("REPLY: %d\n", jtag->reply_len);
-    hexdump(jtag->reply_buffer+2, jtag->reply_len);
+    //printf("REPLY: %d\n", jtag->reply_len);
+    //hexdump(jtag->reply_buffer+2, jtag->reply_len);
     
     // data is always stored from byte 2 on in the reply buffer, so that the
     // ftdi status can be placed in front
@@ -947,7 +956,7 @@ static void check_for_outgoing_data(struct jtag *jtag) {
     }
     jtag->tx_pending = true;
   } else {
-    printf("REPLY: no pending data\n");
+    // printf("REPLY: no pending data\n");
     
     usb_start_transfer(usb_get_endpoint_configuration(jtag->eps[0]), FTDI_REPLY_STATUS, 2);    
     jtag->tx_pending = true;
@@ -959,34 +968,55 @@ void ep1_in_handler(__unused uint8_t *buf, uint16_t len) {
   // EP1 handles incoming data for port 0
   struct jtag *jtag = &dev_config.ports[0].jtag;
   
-#ifdef DEBUG_BULK
+#ifdef DEBUG_BULK0
   printf("EP1 >>>>>>>>>> Sent %d bytes to host\n", len);
   hexdump(buf, len);
 #endif
-  
+
   jtag->tx_pending = false;
   check_for_outgoing_data(jtag);
 }
 
 static void mpsse_parse_all(struct jtag *jtag, uint8_t *buf, uint16_t len) {
-  // check if there are remaining bytes to shift from previous request
-  if(jtag->pending_writes) {
-    uint16_t bytes2shift = (len < jtag->pending_writes)?len:jtag->pending_writes;
-    // printf("add %d\n", bytes2shift);    
+  if(jtag->mode == 1) {
+    printf("BITBANG\n");
 
-    jtag_data(jtag, buf,jtag->pending_write_cmd & 0x20, (uint32_t)bytes2shift*8);
-    jtag->pending_writes -= bytes2shift;
+    // handle upper four bits
+    for(int i=0;i<4;i++) {
+      if((jtag->pio.pins_upper[i] != -1) && jtag->gpio_dir & (1<<i)) {	
+	printf("drive %d to %d\n", 4+i, buf[0] & (1<<(i+4))?1:0);
+	gpio_put(jtag->pio.pins_upper[i], (buf[0]&(1<<(i+4)))?1:0);
+      }
+    }
 
-    len -= bytes2shift;
-    buf += bytes2shift;
-    if(!len) return;
+    // TODO: return input state
   }
   
-  int x = mpsse_parse(jtag, buf, len);
-  while(x && len) {
-    buf += x;
-    len -= x;
-    x = mpsse_parse(jtag, buf, len);
+  // check if this port is in mpsse mode at all
+  if(jtag->mode == 2) {
+    // check if there are remaining bytes to shift from previous request
+    if(jtag->pending_writes) {
+      uint16_t bytes2shift = (len < jtag->pending_writes)?len:jtag->pending_writes;
+      // printf("add %d\n", bytes2shift);    
+      
+      jtag_write_tdi_read_tdo(&jtag->pio, buf,
+			      (jtag->pending_write_cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL,
+			      (uint32_t)bytes2shift*8);
+      if(jtag->pending_write_cmd & 0x20) jtag->reply_len += bytes2shift;
+      
+      jtag->pending_writes -= bytes2shift;
+      
+      len -= bytes2shift;
+      buf += bytes2shift;
+      if(!len) return;
+    }
+    
+    int x = mpsse_parse(jtag, buf, len);
+    while(x && len) {
+      buf += x;
+      len -= x;
+      x = mpsse_parse(jtag, buf, len);
+    }
   }
 
   //  if(len) printf("---------------- leftover %d ----------------\n", len);
@@ -996,7 +1026,7 @@ void ep2_out_handler(uint8_t *buf, uint16_t len) {
   // EP2 handles outgoing data for port 0
   struct jtag *jtag = &dev_config.ports[0].jtag;
 
-#ifdef DEBUG_BULK
+#ifdef DEBUG_BULK0
   printf("EP2 >>>>>>>>>>>> RX <<<<<<<<<<<<<\n");
   hexdump(buf, len);
 #endif
@@ -1011,7 +1041,7 @@ void ep3_in_handler(__unused uint8_t *buf, uint16_t len) {
   // EP3 handles incoming data for port 1
   struct jtag *jtag = &dev_config.ports[1].jtag;
 
-#ifdef DEBUG_BULK
+#ifdef DEBUG_BULK1
   printf("EP3 >>>>>>>>>> Sent %d bytes to host\n", len);
   hexdump(buf, len);
 #endif
@@ -1024,7 +1054,7 @@ void ep4_out_handler(uint8_t *buf, uint16_t len) {
   // EP4 handles outgoing data for port 1
   struct jtag *jtag = &dev_config.ports[1].jtag;
 
-#ifdef DEBUG_BULK
+#ifdef DEBUG_BULK1
   printf("EP4 >>>>>>>>>>>> RX <<<<<<<<<<<<<\n");
   hexdump(buf, len);
 #endif
@@ -1035,25 +1065,48 @@ void ep4_out_handler(uint8_t *buf, uint16_t len) {
   usb_start_transfer(usb_get_endpoint_configuration(EP4_OUT_ADDR), NULL, 64);
 }
 
+void pio_jtag_init(pio_jtag_inst_t* jtag_pio) {
+  printf(">> Initializing PIO JTAG #%d <<\n", (jtag_pio->pio == pio0)?1:2);
+  
+  init_jtag(jtag_pio, 1000);      // initially go with 1 Mhz TCK clock
+  jtag_enable(jtag_pio, false);   // start with jtag disabled and the JTAG pins switched to input
+
+  // handle the upper four GPIO pins of the port if present
+  for(int i=0;i<4;i++) {
+    if(jtag_pio->pins_upper[i] != -1) {
+      printf("GPIO %d = pin %d\n", i, jtag_pio->pins_upper[i]);
+
+      // by default the pins are inputs
+      gpio_init(jtag_pio->pins_upper[i]);
+      gpio_set_dir(jtag_pio->pins_upper[i], GPIO_IN);      
+    }
+  }
+}
+
 int main(void) {
-    stdio_init_all();
-    printf("<<<<<<<<<<<<<<<<< Pico MPSSE >>>>>>>>>>>>>>>>>>\n");
-    usb_device_init();
-    jtag_gpio_init();
+  // lowering the system clock from 125MHz to 120Mhz allows to
+  // run the JTAG at exactly 6MHz
+  set_sys_clock_khz(120000, true);
+
+  stdio_init_all();
+  printf("<<<<<<<<<<<<<<<<< Pico MPSSE >>>>>>>>>>>>>>>>>>\n");
     
-    // Wait until configured
-    while(!configured)
-        tight_loop_contents();
-
-    // get ready to tx to host
-    check_for_outgoing_data(&dev_config.ports[0].jtag);
-    check_for_outgoing_data(&dev_config.ports[1].jtag);
-	
-    // Get ready to rx from host
-    usb_start_transfer(usb_get_endpoint_configuration(EP2_OUT_ADDR), NULL, 64);
-    usb_start_transfer(usb_get_endpoint_configuration(EP4_OUT_ADDR), NULL, 64);
-
-    // Everything is interrupt driven so just loop here
-    while(1)
-        tight_loop_contents();
+  pio_jtag_init(&dev_config.ports[0].jtag.pio);
+  pio_jtag_init(&dev_config.ports[1].jtag.pio);
+    
+  usb_device_init();
+  
+  // Wait until configured
+  while(!configured) tight_loop_contents();
+  
+  // get ready to tx to host
+  check_for_outgoing_data(&dev_config.ports[0].jtag);
+  check_for_outgoing_data(&dev_config.ports[1].jtag);
+  
+  // Get ready to rx from host
+  usb_start_transfer(usb_get_endpoint_configuration(EP2_OUT_ADDR), NULL, 64);
+  usb_start_transfer(usb_get_endpoint_configuration(EP4_OUT_ADDR), NULL, 64);
+  
+  // Everything is interrupt driven so just loop here
+  while(1) tight_loop_contents();
 }

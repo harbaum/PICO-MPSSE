@@ -2,24 +2,30 @@
 
 This is a FTDI MPSSE compatible JTAG implementation for the Raspberry
 Pi Pico's RP2040 MCU. It allows to use the Raspberry Pi Pico as a
-replacement for the FTDI MPSSE device family and use the Pico e.g.
-as a flash adapter for FPGA boards.
+replacement for the FTDI MPSSE ftx232 device family and use the Pico
+e.g. as a flash adapter for FPGA boards.
+
+This image shows an Efinix Trion T20 BGS256 Development Kit being
+programmed using a Raspberry Pi Pico and bypassing the on-board ft2232.
+
+![Efinix T20 with Raspberry Pi Pico](efinix_pico.jpeg)
 
 ## Pin usage
 
-| FTXXX  | JTAG | DIR | RP2040 |
-|--------|------|-----|--------|
-| D0     | TCK  |  O  |  18    |
-| D1     | TDI  |  O  |  16    |
-| D2     | TDO  |  I  |  17    |
-| D3     | TMS  |  O  |  19    |
+![Default pin mapping](pico-mpsse-pinout.png)
 
 ## Current state
 
-The device implements a very basic MPSSE barely sufficient to be used
-for JTAG. It has successfully been used to detect various chips in a
-JTAG border scan and to program the Efinix Trion T20 FPGA using
-[openFPGAloader](https://github.com/trabucayre/openFPGALoader).
+The device implements a very basic MPSSE sufficient to be used for two
+JTAG ports as present on ftx232 like devices as well. It also
+implements parts of the BITBANG mode and the GPIO handling to allow to
+use ports BD[4-7] and AD[4-7] to generate control signals. The efinix
+FPGAs e.g. use pin AD[4] to control the FPGAs CRESET signal.
+
+It has successfully been used to detect various chips in a JTAG border
+scan and to program the Efinix Trion T20 FPGA using
+[openFPGAloader](https://github.com/trabucayre/openFPGALoader) as well
+as the [Efinity Programmer](https://www.efinixinc.com/products-efinity.html).
 
 ## Installation
 

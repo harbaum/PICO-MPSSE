@@ -6,8 +6,9 @@
 #define PICO_MPSSE_H_
 
 #include "usb_common.h"
+#include "pio_jtag.h"
 
-#define MAX_PKT_SIZE  64 // should actually be 512, but we aren't detected as highspeed ...
+#define MAX_PKT_SIZE  64 // should actually be 512, but this is no highspeed device ...
 
 typedef void (*usb_ep_handler)(uint8_t *buf, uint16_t len);
 
@@ -26,7 +27,7 @@ struct usb_endpoint_configuration {
     uint8_t next_pid;
 };
 
-// TODO: cleanup the interfaces
+#define MODE_MPSSE  2
 
 struct jtag {
   bool tx_pending;
@@ -35,6 +36,9 @@ struct jtag {
   uint8_t eps[2];
   uint16_t pending_writes;
   uint8_t pending_write_cmd;
+  uint8_t mode;  // 2=MPSSE
+  uint8_t gpio_dir;
+  pio_jtag_inst_t pio;
 };
 
 // Struct in which we keep the device configuration
