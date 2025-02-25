@@ -48,7 +48,7 @@ Bus 001 Device 003: ID 0403:6010 Future Technology Devices International, Ltd FT
 The openFPGAloader should be able to open and use it:
 
 ```
-$ openFPGAloader --detect
+$ openFPGAloader -b trion_t20_bga256_jtag --detect
 empty
 No cable or board specified: using direct ft2232 interface
 Jtag frequency : requested 6.00MHz   -> real 6.00MHz  
@@ -60,7 +60,12 @@ index 0:
         irlength 4
 ```
 
+Attention: The support for the Trion T20 dev board has recently been
+fixed in openFPGAloader and you might need to pull it freshly from
+github to work. This is not related to the PICO MPSSE and applies to
+using the dev kits on-board programmer as well.
+
 ## Related projects
 
   - [Pico-DirtyJtag](https://github.com/phdussud/pico-dirtyJtag)
-  
+  - [openFPGAloader](https://trabucayre.github.io/openFPGALoader/index.html)
