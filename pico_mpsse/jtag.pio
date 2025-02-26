@@ -1,6 +1,6 @@
 ;JTAG implementation
 
-.program djtag_tdo
+.program jtag_io
 .side_set 1 opt
 
 ; Pin assignments:
@@ -14,21 +14,40 @@
 
 ; data is captured on the leading edge of each TCK pulse, and
 ; transitions on the trailing edge, or some time before the first leading edge.
-    pull            side 0      ; get length-1 and disregard previous OSR state 
-    out x, 32       side 0      ; this moves the first 31 bits into X	
+restart:
+    pull                        ; get length-1 and disregard previous OSR state 
+    out y, 1                    ; this moves the first bit into Y	
+    jmp y-- setbits             ; check if setting single bits without clocking is requested
+    out x, 31                   ; this moves the remaining 31 bits into X	
 loop:
-    out pins, 2     side 0      ; 0 Stall here on empty (sideset proceeds even if instruction stalls, so we stall with TCK low
-    nop             side 1      ; 1 raise TCK
-    in pins, 1      side 1      ; 1 sample TDO
-    jmp x-- loop    side 0      ; 0
-    push            side 0      ; 0 Force the last ISR bits to be pushed to the tx fifo
+    out pins, 2                 ; Stall here on empty (sideset proceeds even if instruction stalls, so we stall with TCK low
+    nop             side 1      ; raise TCK
+    in pins, 1                  ; sample TDO
+    jmp x-- loop    side 0      ; lower TCK
+    push                        ; Force the last ISR bits to be pushed to the tx fifo
+    jmp restart
+
+; A command has been received to set the three output bits individually. This is
+; used whenever the MPSSE "Set data bits" command is being used. This usually isn't
+; used in JTAG mode. But e.g. when talking to SPI components the CS signal may be
+; controlled this way.
+setbits:
+    out y, 1                    ;
+    jmp y-- tck_low
+    nop             side 1      ; raise TCK
+tck_low:
+    jmp do_tdi_tms
+    nop             side 0      ; lower TCK
+do_tdi_tms:
+    out pins, 2                 ; send TDI and TMS directly
+
 
 % c-sdk {
 #include "hardware/gpio.h"
-static inline void pio_jtag_init(PIO pio, uint sm,
+static inline void pio_jtag_io_init(PIO pio, uint sm,
         uint16_t clkdiv, uint pin_tck, uint pin_tdi, uint pin_tms, uint pin_tdo) {
-    uint prog_offs = pio_add_program(pio, &djtag_tdo_program);
-    pio_sm_config c = djtag_tdo_program_get_default_config(prog_offs);
+    uint prog_offs = pio_add_program(pio, &jtag_io_program);
+    pio_sm_config c = jtag_io_program_get_default_config(prog_offs);
 
     sm_config_set_out_pins(&c, pin_tdi, 2);  // next pin after tdi needs to be tms
     sm_config_set_in_pins(&c, pin_tdo);

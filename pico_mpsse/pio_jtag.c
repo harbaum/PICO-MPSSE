@@ -4,9 +4,10 @@
 #include "jtag.pio.h"
 
 #include <stdio.h>
+#include <string.h>
 #include "config.h"
 
-void dma_init(pio_jtag_inst_t* jtag) {
+static void dma_init(pio_jtag_inst_t* jtag) {
   // Configure a channel to write a buffer to PIO
   // SM0's TX FIFO, paced by the data request signal from that peripheral.
   jtag->tx_dma_chan = dma_claim_unused_channel(true);
@@ -40,17 +41,23 @@ void dma_init(pio_jtag_inst_t* jtag) {
 			);
 }
 
-void __time_critical_func(pio_jtag_blocking)(pio_jtag_inst_t *jtag, const uint8_t *bsrc, uint8_t *bdst, size_t len) {
+void pio_set_outputs(pio_jtag_inst_t *jtag, uint8_t bits) {
+  // make sure there's space to send further data into tx fifo
+  while(pio_sm_is_tx_fifo_full(jtag->pio, jtag->sm))
+    tight_loop_contents();
+  
+  // send msb 1 and the three bits encoded in 32 bits
+  *(io_rw_32 *)(&jtag->pio->txf[jtag->sm]) = 0x80000000 | (bits << (31-3));
+}
+
+static void __time_critical_func(pio_jtag_blocking)(pio_jtag_inst_t *jtag, const uint8_t *bsrc, uint8_t *bdst, size_t len) {
   size_t byte_length = (len+7)/8;  // bytes needed for len bits
   size_t last_shift = ((byte_length << 3) - len);
   size_t tx_remain = (len+3)/4, rx_remain = last_shift ? byte_length : byte_length+1;
-  // uint8_t* rx_last_byte_p = &bdst[byte_length-1];
   io_rw_8 *txfifo = (io_rw_8 *) &jtag->pio->txf[jtag->sm];
   static uint8_t x; // scratch local to receive data if no receive buffer is provided
-  //kick off the process by sending the len to the tx pipeline
 
-  // if(bdst && last_shift) printf("#%d ----> LAST SHIFT %d\n", (jtag->pio==pio0)?0:1, last_shift);
-  
+  // wait now, if we've received further data via USB and the last PIO transfer is still in progress
   if(jtag->write_pending) {
     while (dma_channel_is_busy(jtag->rx_dma_chan))
       tight_loop_contents();
@@ -58,6 +65,11 @@ void __time_critical_func(pio_jtag_blocking)(pio_jtag_inst_t *jtag, const uint8_
     jtag->write_pending = false;
   }
 
+  // make sure we are good to write to tx fifo
+  while(pio_sm_is_tx_fifo_full(jtag->pio, jtag->sm))
+    tight_loop_contents();
+  
+  // kick off the process by sending the len to the tx pipeline
   *(io_rw_32*)txfifo = len-1;
   
   channel_config_set_write_increment(&jtag->rx_c, bdst?true:false);
@@ -66,17 +78,17 @@ void __time_critical_func(pio_jtag_blocking)(pio_jtag_inst_t *jtag, const uint8_
   dma_channel_set_config(jtag->tx_dma_chan, &jtag->tx_c, false);
   
   dma_channel_transfer_to_buffer_now(jtag->rx_dma_chan, (void*)(bdst?bdst:&x), rx_remain);
-  dma_channel_transfer_from_buffer_now(jtag->tx_dma_chan, (void*)bsrc, tx_remain);
-  
-  if(bdst || 1)  {
-    while (dma_channel_is_busy(jtag->rx_dma_chan)) tight_loop_contents();
 
-    // enabling this actually makes efinity programmer to not detect the FPGA
-    //    if (last_shift)
-    //      *rx_last_byte_p = *rx_last_byte_p << last_shift;
-  } else
+  if(bdst)  {
+    dma_channel_transfer_from_buffer_now(jtag->tx_dma_chan, (void*)bsrc, tx_remain);
+    while (dma_channel_is_busy(jtag->rx_dma_chan)) tight_loop_contents();
+  } else {
+    // use buffer, so USB can already refill the current buffer 
+    memcpy(jtag->write_buffer, bsrc, tx_remain);
+    dma_channel_transfer_from_buffer_now(jtag->tx_dma_chan, jtag->write_buffer, tx_remain);  
     jtag->write_pending = true;
-  
+  }
+    
   // stop the compiler hoisting a non volatile buffer access above the DMA completion.
   __compiler_memory_barrier();
 }
@@ -91,7 +103,7 @@ static uint16_t jtag_get_clk_divider(int freq_khz) {
   return divider;
 }
 
-void jtag_set_clk_freq(pio_jtag_inst_t *jtag, uint freq_khz) {
+void pio_jtag_set_clk_freq(pio_jtag_inst_t *jtag, uint freq_khz) {
   pio_sm_set_clkdiv_int_frac(jtag->pio, jtag->sm, jtag_get_clk_divider(freq_khz), 0);
 }
 
@@ -99,7 +111,7 @@ void jtag_set_clk_freq(pio_jtag_inst_t *jtag, uint freq_khz) {
 static uint16_t interleave_table[256];
 
 // TODO: include this into the interleave calculation 
-uint8_t bit_reverse_u8(uint8_t byte) {
+static uint8_t bit_reverse_u8(uint8_t byte) {
   byte = ((byte & 0x55) << 1) | ((byte & 0xaa) >> 1);
   byte = ((byte & 0x33) << 2) | ((byte & 0xcc) >> 2);
   byte = ((byte & 0x0f) << 4) | ((byte & 0xf0) >> 4);
@@ -107,7 +119,7 @@ uint8_t bit_reverse_u8(uint8_t byte) {
   return byte;
 }
 
-void jtag_enable(pio_jtag_inst_t* jtag, bool enable) {
+void pio_jtag_enable(pio_jtag_inst_t* jtag, bool enable) {
   if(enable) {
     printf("JTAG #%d ENABLE\n", (jtag->pio==pio0)?0:1);
     int gpio_func_pio = (jtag->pio == pio0)?GPIO_FUNC_PIO0:GPIO_FUNC_PIO1;
@@ -123,63 +135,59 @@ void jtag_enable(pio_jtag_inst_t* jtag, bool enable) {
   }
 }
     
-void init_jtag(pio_jtag_inst_t* jtag, uint freq) {
+void pio_jtag_init(pio_jtag_inst_t* jtag, uint freq) {
   uint16_t clkdiv = jtag_get_clk_divider(freq);   // clkdiv = 31;  // around 1 MHz @ 125MHz clk_sys
-  pio_jtag_init(jtag->pio, jtag->sm, clkdiv, jtag->pin_tck, jtag->pin_tdi, jtag->pin_tms, jtag->pin_tdo);
+  pio_jtag_io_init(jtag->pio, jtag->sm, clkdiv, jtag->pin_tck, jtag->pin_tdi, jtag->pin_tms, jtag->pin_tdo);
   dma_init(jtag);    
   
-  // Setup the interleave table. This does three things:
+  // Setup the interleave table. This does two things:
   // - it expands with every second bit being 0
   // - it swaps high and low byte in the 16 bit target
-  // - it reversed the bit order
-  for(uint16_t j=0;j<256;j++) {
-    uint8_t i = bit_reverse_u8(j);
-    interleave_table[j] =
+  for(uint16_t i=0;i<256;i++) {
+    interleave_table[i] =
 	((i&0x01)<< 8) | ((i&0x02)<< 9) | ((i&0x04)<<10) | ((i&0x08)<<11) |
 	((i&0x10)>> 4) | ((i&0x20)>> 3) | ((i&0x40)>> 2) | ((i&0x80)>> 1);
   }
 }
 
 // TODO: integrate this into the transmit function
-void jtag_write_tms(pio_jtag_inst_t* jtag, uint tdi, const uint8_t *src, uint8_t *dst, size_t len) {
+void pio_jtag_write_tms(pio_jtag_inst_t* jtag, bool lsb, uint tdi, const uint8_t *src, uint8_t *dst, size_t len) {
   uint16_t wlen = (len+7)/8;
   uint16_t tx_buffer[wlen];  // bytes are expanded to words for interleaved two-bit-transmission
   uint16_t tdi_mask = tdi?0x5555:0x0000;
   
   for(int i;i<wlen;i++)
-    tx_buffer[i] = (interleave_table[src[i]]<<1) | tdi_mask;
+    tx_buffer[i] = (interleave_table[lsb?bit_reverse_u8(src[i]):src[i]]<<1) | tdi_mask;
 
   pio_jtag_blocking(jtag, (const uint8_t *)tx_buffer, dst, len);  
 
   // bit reverse result
-  if(dst)
+  if(dst && lsb)
     for(int i=0;i<wlen;i++)
       dst[i] = bit_reverse_u8(dst[i]);  
 }
 
-void jtag_write_tdi_read_tdo(pio_jtag_inst_t* jtag, const uint8_t *src, uint8_t *dst, size_t len) {
+void pio_jtag_write_tdi_read_tdo(pio_jtag_inst_t* jtag, bool lsb, const uint8_t *src, uint8_t *dst, size_t len) {
   uint16_t wlen = (len+7)/8;
   uint16_t tx_buffer[wlen];  // bytes are expanded to words for interleaved two-bit-transmission
 
-  // printf("LEN %d %d\n", len, wlen);
-  
   // drive TMS constant 0 when writing tdi
   for(int i=0;i<wlen;i++)
-    tx_buffer[i] = src?interleave_table[src[i]]:0x5555;
+    tx_buffer[i] = src?interleave_table[lsb?bit_reverse_u8(src[i]):src[i]]:0x5555;
 
   pio_jtag_blocking(jtag, (const uint8_t *)tx_buffer, dst, len);
 
-  // bit reverse result
-  if(dst)
+  // bit reverse result if lsb first was requested
+  if(dst && lsb)
     for(int i=0;i<wlen;i++)
       dst[i] = bit_reverse_u8(dst[i]);  
 }
 
-void jtag_write_tdi(pio_jtag_inst_t* jtag, const uint8_t *src, size_t len) {
-  jtag_write_tdi_read_tdo(jtag, src, NULL, len);
+void pio_jtag_write_tdi(pio_jtag_inst_t* jtag, bool lsb, const uint8_t *src, size_t len) {
+  pio_jtag_write_tdi_read_tdo(jtag, lsb, src, NULL, len);
 }
 
-void jtag_read_tdo(pio_jtag_inst_t* jtag, uint8_t *dst, size_t len) {
-  jtag_write_tdi_read_tdo(jtag, NULL, dst, len);
+void pio_jtag_read_tdo(pio_jtag_inst_t* jtag, bool lsb, uint8_t *dst, size_t len) {
+  pio_jtag_write_tdi_read_tdo(jtag, lsb, NULL, dst, len);
 }
 
