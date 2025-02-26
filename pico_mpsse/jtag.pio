@@ -32,15 +32,14 @@ loop:
 ; used in JTAG mode. But e.g. when talking to SPI components the CS signal may be
 ; controlled this way.
 setbits:
-    out y, 1                    ;
-    jmp y-- tck_low
-    nop             side 1      ; raise TCK
-tck_low:
-    jmp do_tdi_tms
+    out y, 1                    ; read requested TCK state
+    jmp y-- tck_high
     nop             side 0      ; lower TCK
+    jmp do_tdi_tms
+tck_high:
+    nop             side 1      ; raise TCK
 do_tdi_tms:
-    out pins, 2                 ; send TDI and TMS directly
-
+    out pins, 2                 ; set TDI and TMS directly
 
 % c-sdk {
 #include "hardware/gpio.h"

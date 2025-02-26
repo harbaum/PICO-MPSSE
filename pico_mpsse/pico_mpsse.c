@@ -763,14 +763,18 @@ static uint16_t mpsse_cmd_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
       // second payload byte is direction. Lowest bits 0x0b is JTAG (and SPI) mapping
       pio_jtag_enable(&jtag->pio, (buf[2] & 0x0f) == 0x0b);
 
-#if 0
-      // check if someone is trying to drive TMS directly. This happens e.g. if this is actually
-      // used for SPI instead of JTAG
-      if(buf[2] & 8) {
-	printf("Someone is driving TMS %d!!!!!!!\n", (buf[1]&8)?1:0);
-	gpio_put(jtag->pio.pin_tms, (buf[1]&8)?1:0);
+      // PIO is only used in JTAG/SPI compatible mode with direction of D0-D3 being 0x0b
+      if((buf[2] & 0x0f) == 0x0b) {
+      
+	// this command also sets a certain state to the lower output pins
+	uint8_t ostate = 0;
+	if((buf[2] & (1<<0)) && (buf[1] & (1<<0))) ostate |= PIO_JTAG_BIT_TCK;
+	if((buf[2] & (1<<1)) && (buf[1] & (1<<1))) ostate |= PIO_JTAG_BIT_TDI;
+	// bit 2 is an input in JTAG/SPI mode and cannot be set this way
+	if((buf[2] & (1<<3)) && (buf[1] & (1<<3))) ostate |= PIO_JTAG_BIT_TMS;
+	printf("SET GPIO %02x\n", ostate);
+	pio_set_outputs(&jtag->pio, ostate);
       }
-#endif
       
       // handle upper gpio if present
       for(int i=0;i<4;i++) {
@@ -802,6 +806,21 @@ static uint16_t mpsse_cmd_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
   case 0x81:
   case 0x83:
     printf("MPSSE: Get data bits %s\n", (buf[0]&2)?"high":"low");
+
+    // send input state in a reply byte
+    uint8_t reply = 0;
+
+    // check the TDO state. TCK, TDI and TMS are outputs
+    if(gpio_get(jtag->pio.pin_tdo)) reply |= (1<<2);
+
+    // check state of upper four bits
+    for(int i=0;i<4;i++)
+      if((jtag->pio.pins_upper[i] != -1) && !(jtag->gpio_dir & (1<<i)))
+	if(gpio_get(jtag->pio.pins_upper[i])) reply |= (1<<(4+i));
+    
+    jtag->reply_buffer[jtag->reply_len] = reply;
+    jtag->reply_len += 1;
+    
     return 1;
     break;
     
@@ -889,7 +908,6 @@ static uint16_t mpsse_shift_parse(struct jtag *jtag, uint8_t *buf, uint16_t len)
     printf("MPSSE: shift %d bits\n", shift_len);
 #endif
 
-    // new PIO code
     if(cmd & 0x40) {
       // printf("JTAG TMS BIT WRITE %d ", shift_len); hexdump(buf, 1);
       pio_jtag_write_tms(&jtag->pio, (cmd&8)?1:0, (buf[0]&0x80)?1:0, buf,
@@ -1111,7 +1129,7 @@ int main(void) {
     
   jtag_init(&dev_config.ports[0].jtag.pio);
   jtag_init(&dev_config.ports[1].jtag.pio);
-    
+
   usb_device_init();
   
   // Wait until configured

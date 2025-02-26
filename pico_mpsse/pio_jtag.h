@@ -23,9 +23,15 @@ typedef struct pio_jtag_inst {
   uint8_t write_buffer[128];
 } pio_jtag_inst_t;
 
+// bits to request single bit states via pio_set_outputs()
+#define PIO_JTAG_BIT_TDI  1  // D1
+#define PIO_JTAG_BIT_TMS  2  // D3
+#define PIO_JTAG_BIT_TCK  4  // D0
+
 //interface to the PIO engine itself
 void pio_jtag_init(pio_jtag_inst_t* jtag, uint freq);
 void pio_jtag_set_clk_freq(pio_jtag_inst_t *jtag, uint freq_khz);
+void pio_set_outputs(pio_jtag_inst_t *jtag, uint8_t bits);
 
 // convenience and support functions
 void pio_jtag_enable(pio_jtag_inst_t* jtag, bool enable); 
