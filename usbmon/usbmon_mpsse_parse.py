@@ -363,8 +363,8 @@ def jtag_parse(tms_in, tdi, reading):
     state = JTAG_STATES[jtag["state"]]
     if tms_in != None:
         jtag["tms"] = tms_in  # remember new TMS state
-        
-    if state[jtag["tms"]]:
+
+    if jtag["tms"] != None and state[jtag["tms"]]:
         # it's actually unexpected that an implicit TMS value
         # changes the state. So let's keep an eye on that
         if tms_in == None:
@@ -580,14 +580,14 @@ def parse_mpsse_shift(cmd, data):
             
     # we always expect W-VE- when writing with <W-TDI> or <W-TMS> bits set
     if cmd & (0x10 | 0x40) and not cmd & 0x01:
-        print(LIGHT_RED + "Warning: Unexpected W+VE. JTAG should write on the falling edge!" + END)
+        print(LIGHT_RED + "JTAG Warning: Unexpected W+VE. JTAG should write on the falling edge!" + END)
 
     # we always expect R-VE+ when reading with <R-TDO>
     if cmd & 0x20 and cmd & 0x04:
-        print(LIGHT_RED + "Warning: Unexpected R-VE. JTAG should read on the rising edge!" + END)
+        print(LIGHT_RED + "JTAG Warning: Unexpected R-VE. JTAG should read on the rising edge!" + END)
 
     if not cmd & 0x08:
-        print(LIGHT_RED + "Warning: Unexpected MSB first" + END)
+        print(LIGHT_RED + "JTAG Warning: Unexpected MSB first" + END)
 
     # return data with consumed bytes removed
     return data
@@ -637,7 +637,7 @@ def parse_bulk_out_mpsse(data):
             if(data[2] & (0x80>>i)): iostr = iostr + "O"
             else:                    iostr = iostr + "I"
                 
-        print("Set Data Bits","low" if data[0] == 0x80 else "high","byte value", hex(data[1]), "direction", iostr)
+        print("Set Data Bits","low" if data[0] == 0x80 else "high","byte value", hex(data[1]), "direction", hex(data[2])+"="+iostr)
         return data[3:]
                 
     elif data[0] == 0x84:
@@ -724,14 +724,14 @@ def parse_bulk_out(data):
     global port_mode
     
     # check if we are in MPSSE mode
-    if port_mode.lower() == "mpsse":
+    if port_mode and port_mode.lower() == "mpsse":
         while data and mpsse_cmd_is_complete(data):
             data = parse_bulk_out_mpsse(data)
         return data
-    elif port_mode.lower() == "bitbang":
+    elif port_mode and port_mode.lower() == "bitbang":
         parse_bulk_out_bitbang(data)
     else:
-        print(LIGHT_RED+"Warning: no in mpsse mode", END)
+        print(LIGHT_RED+"Warning: not in mpsse mode", END)
         
     return None
     
