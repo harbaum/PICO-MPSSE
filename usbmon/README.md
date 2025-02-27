@@ -51,12 +51,12 @@ it shows up as bus 1 and devices ce 34 in the trace.
 ## Example
 
 An example of a FTDI232H on USB Bus 1, Device 17 being used to detect
-a Efinix Trion T20 FPGA using openfpgaloader [is being included](ft232h_openfpgaloader_detect_t20_on_1:017.txt).
+a Efinix Trion T20 FPGA using openfpgaloader [is being included](ft232h_openfpgaloader_detect_t20_on_1_017.txt).
 
 It can be parsed like so:
 
 ```
-$ ./usbmon_mpsse_parse.py "ft232h_openfpgaloader_detect_t20_on_1:017.txt" 1:17
+$ ./usbmon_mpsse_parse.py "ft232h_openfpgaloader_detect_t20_on_1_017.txt" 1:17
 USBMON MPSSE parser
 USB Vendor request 0x0 Reset -> Reset SIO
 USB Vendor request 0x3 Set baud rate -> divisor=0x20104e2 9600.0
