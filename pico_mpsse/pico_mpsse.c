@@ -994,7 +994,7 @@ static uint16_t mpsse_shift_parse(struct jtag *jtag, uint8_t *buf, uint16_t len)
 
   // it may happen that we are supposed to shift out more bits than we have payload
   if((cmd & 0x10) && (3+shift_len > len)) {
-    printf("---------------------> truncating write %d to %d\n", shift_len, len-3);
+    // printf("---------------------> truncating write %d to %d\n", shift_len, len-3);
 
     pio_jtag_write_tdi_read_tdo(&jtag->pio, (cmd&8)?1:0, buf+3,
 	    (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL,(len-3)*8);
@@ -1088,7 +1088,7 @@ static void mpsse_parse_all(struct jtag *jtag, uint8_t *buf, uint16_t len) {
     // check if there are remaining bytes to shift from previous request
     if(jtag->pending_writes) {
       uint16_t bytes2shift = (len < jtag->pending_writes)?len:jtag->pending_writes;
-      printf("--> add %d of %d\n", bytes2shift, jtag->pending_writes);
+      // printf("--> add %d of %d\n", bytes2shift, jtag->pending_writes);
       
       pio_jtag_write_tdi_read_tdo(&jtag->pio, (jtag->pending_write_cmd&8)?1:0, buf,
 			      (jtag->pending_write_cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL,
