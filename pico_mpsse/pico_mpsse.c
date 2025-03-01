@@ -489,6 +489,27 @@ void usb_handle_status_request(volatile struct usb_setup_packet *pkt) {
  */
 static void check_for_outgoing_data(struct jtag *jtag);
 
+/* this is a fake eeprom. It's not permanent and changes from PC */
+/* are lost after power cycle */
+static uint16_t eeprom_dummy_data[256] = { 
+  0x0801, 0x0403, 0x6010, 0x0500, 0x00c0, 0x0000, 0x0200, 0x1296,
+  0x16a8, 0x14be, 0x0046, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0312, 0x004e, 0x006f, 0x0074, 0x0020,
+  0x0046, 0x0054, 0x0044, 0x0049, 0x0316, 0x0050, 0x0069, 0x0063,
+  0x006f, 0x0020, 0x004d, 0x0050, 0x0053, 0x0053, 0x0045, 0x0314,
+  0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,
+  0x0038, 0x0302, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x6aa4
+};
+
 void usb_handle_setup_packet(void) {
     volatile struct usb_setup_packet *pkt = (volatile struct usb_setup_packet *) &usb_dpram->setup_packet;
     uint8_t req_direction = pkt->bmRequestType;
@@ -584,32 +605,45 @@ void usb_handle_setup_packet(void) {
 	}
 	break;
 
+      case 0x91:
+	printf("FTDI WRITE EEPROM, #%d=%04x\n", pkt->wIndex, pkt->wValue);
+	if(pkt->wIndex < 256) eeprom_dummy_data[pkt->wIndex] = pkt->wValue;
+	break;
+
+      case 0x92:
+	printf("FTDI ERASE EEPROM, #%d=0x%04x\n", pkt->wIndex, pkt->wValue);
+	// zero out our entire fake eeprom ...
+	memset(eeprom_dummy_data, 0, sizeof(eeprom_dummy_data));
+	break;
+	
       default:
-	printf("Unsupported vendor request %02x, #%d=%d\n", pkt->bRequest, pkt->wIndex, pkt->wValue);
+	printf("Unsupported vendor out request %02x, #%d=%d\n", pkt->bRequest, pkt->wIndex, pkt->wValue);
 	break;	
       }
       usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
     }
     else if (req_direction == 0xc0) {
-      printf("VENDOR IN %02x\n", pkt->bRequest);
-
-      // read eeprom
-      if(pkt->bRequest == 0x90) {
-	const uint16_t eeprom_info[] = {
-	  0x0800, 0x0403, 0x6010, 0x0500, 0x3280, 0x0000, 0x0200, 0x1096,
-	  0x1aa6, 0x0000, 0x0046, 0x0310, 0x004f, 0x0070, 0x0065, 0x006e,
-	  0x002d, 0x0045, 0x0043, 0x031a, 0x0055, 0x0053, 0x0042, 0x0020,
-	  0x0044, 0x0065, 0x0062, 0x0075, 0x0067, 0x0067, 0x0065, 0x0072,
-	  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
-	  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
-	  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
-	  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x1027 
-	};
-
-	// return one word of the eeprom description
-	usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), (uint8_t*)&eeprom_info[pkt->wIndex], 2);
-      } else
+      switch(pkt->bRequest) {
+      case 0x05:
+	printf("FTDI POLL MODEM STATUS\n");
+	usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), FTDI_REPLY_STATUS, 2);
+	break;
+	
+      case 0x90: // read eeprom
+	if(pkt->wIndex < 256) {
+	  printf("FTDI READ EEPROM, #%d=%04x\n", pkt->wIndex, eeprom_dummy_data[pkt->wIndex]);
+	  usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), (uint8_t*)&(eeprom_dummy_data[pkt->wIndex]), 2);
+	} else {
+	  printf("FTDI READ EEPROM, #%d (out of range)\n", pkt->wIndex);
+	  usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
+	}
+	break;
+	
+      default:
+	printf("Unsupported vendor in request %02x, #%d=%d\n", pkt->bRequest, pkt->wIndex, pkt->wValue);
 	usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
+	break;
+      }
     } else
       printf("Uknown request type %02x\n", pkt->bmRequestType);
 
@@ -960,7 +994,7 @@ static uint16_t mpsse_shift_parse(struct jtag *jtag, uint8_t *buf, uint16_t len)
 
   // it may happen that we are supposed to shift out more bits than we have payload
   if((cmd & 0x10) && (3+shift_len > len)) {
-    // printf("---------------------> truncating write %d to %d\n", shift_len, len-3);
+    printf("---------------------> truncating write %d to %d\n", shift_len, len-3);
 
     pio_jtag_write_tdi_read_tdo(&jtag->pio, (cmd&8)?1:0, buf+3,
 	    (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL,(len-3)*8);
@@ -1054,7 +1088,7 @@ static void mpsse_parse_all(struct jtag *jtag, uint8_t *buf, uint16_t len) {
     // check if there are remaining bytes to shift from previous request
     if(jtag->pending_writes) {
       uint16_t bytes2shift = (len < jtag->pending_writes)?len:jtag->pending_writes;
-      // printf("--> add %d of %d\n", bytes2shift, jtag->pending_writes);
+      printf("--> add %d of %d\n", bytes2shift, jtag->pending_writes);
       
       pio_jtag_write_tdi_read_tdo(&jtag->pio, (jtag->pending_write_cmd&8)?1:0, buf,
 			      (jtag->pending_write_cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL,
