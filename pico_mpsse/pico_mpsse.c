@@ -22,10 +22,11 @@
 #include "pio_jtag.h"
 #include "config.h"
 
-// #define DEBUG_BULK0
-// #define DEBUG_BULK1
-// #define DEBUG_SHIFT
-// #define DEBUG_GPIO
+//#define DEBUG_BULK0
+//#define DEBUG_BULK1
+//#define DEBUG_REPLY
+//#define DEBUG_SHIFT
+//#define DEBUG_GPIO
 
 #define FTDI_REPLY_STATUS   "\x32\x60"
 
@@ -591,8 +592,25 @@ void usb_handle_setup_packet(void) {
     }
     else if (req_direction == 0xc0) {
       printf("VENDOR IN %02x\n", pkt->bRequest);
-    }
-    else
+
+      // read eeprom
+      if(pkt->bRequest == 0x90) {
+	const uint16_t eeprom_info[] = {
+	  0x0800, 0x0403, 0x6010, 0x0500, 0x3280, 0x0000, 0x0200, 0x1096,
+	  0x1aa6, 0x0000, 0x0046, 0x0310, 0x004f, 0x0070, 0x0065, 0x006e,
+	  0x002d, 0x0045, 0x0043, 0x031a, 0x0055, 0x0053, 0x0042, 0x0020,
+	  0x0044, 0x0065, 0x0062, 0x0075, 0x0067, 0x0067, 0x0065, 0x0072,
+	  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+	  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+	  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+	  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x1027 
+	};
+
+	// return one word of the eeprom description
+	usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), (uint8_t*)&eeprom_info[pkt->wIndex], 2);
+      } else
+	usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
+    } else
       printf("Uknown request type %02x\n", pkt->bmRequestType);
 
 }
@@ -756,7 +774,9 @@ static uint16_t mpsse_cmd_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
   case 0x80:
   case 0x82:
     if(len < 3) return 0;  // needs at least 3 bytes
-    printf("MPSSE: Set data bits %s value %02x, dir %02x\n", (buf[0]&2)?"high":"low", buf[1], buf[2]);
+    printf("MPSSE: Set data bits %s value %02x, dir %02x=", (buf[0]&2)?"high":"low", buf[1], buf[2]);
+    for(int i=0;i<8;i++) printf("%c", (buf[2]&(0x80>>i))?'O':'I');
+    printf("\n");
     
     /* we currently only support the lower bits */
     if(!(buf[0]&2)) {
@@ -772,7 +792,9 @@ static uint16_t mpsse_cmd_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
 	if((buf[2] & (1<<1)) && (buf[1] & (1<<1))) ostate |= PIO_JTAG_BIT_TDI;
 	// bit 2 is an input in JTAG/SPI mode and cannot be set this way
 	if((buf[2] & (1<<3)) && (buf[1] & (1<<3))) ostate |= PIO_JTAG_BIT_TMS;
-	printf("SET GPIO %02x\n", ostate);
+#ifdef DEBUG_GPIO
+	printf("SET PIO GPIO %02x\n", ostate);
+#endif
 	pio_set_outputs(&jtag->pio, ostate);
       }
       
@@ -817,8 +839,8 @@ static uint16_t mpsse_cmd_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
     for(int i=0;i<4;i++)
       if((jtag->pio.pins_upper[i] != -1) && !(jtag->gpio_dir & (1<<i)))
 	if(gpio_get(jtag->pio.pins_upper[i])) reply |= (1<<(4+i));
-    
-    jtag->reply_buffer[jtag->reply_len] = reply;
+
+    jtag->reply_buffer[jtag->reply_len+2] = reply;
     jtag->reply_len += 1;
     
     return 1;
@@ -969,8 +991,10 @@ static void check_for_outgoing_data(struct jtag *jtag) {
   
   // check if there's now data in the reply buffer and request to return it
   if(jtag->reply_len) {
+#ifdef DEBUG_REPLY
     printf("REPLY: %d\n", jtag->reply_len);
     hexdump(jtag->reply_buffer+2, jtag->reply_len);
+#endif
     
     // data is always stored from byte 2 on in the reply buffer, so that the
     // ftdi status can be placed in front
@@ -1030,7 +1054,7 @@ static void mpsse_parse_all(struct jtag *jtag, uint8_t *buf, uint16_t len) {
     // check if there are remaining bytes to shift from previous request
     if(jtag->pending_writes) {
       uint16_t bytes2shift = (len < jtag->pending_writes)?len:jtag->pending_writes;
-      // printf("add %d\n", bytes2shift);    
+      // printf("--> add %d of %d\n", bytes2shift, jtag->pending_writes);
       
       pio_jtag_write_tdi_read_tdo(&jtag->pio, (jtag->pending_write_cmd&8)?1:0, buf,
 			      (jtag->pending_write_cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL,
