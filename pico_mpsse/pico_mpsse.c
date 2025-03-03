@@ -27,7 +27,10 @@
 //#define DEBUG_REPLY
 //#define DEBUG_SHIFT
 //#define DEBUG_GPIO
+//#define DEBUG_MPSSE
+//#define DEBUG_TRUNCATION
 
+// this is the dummy status reply sent in all replies
 #define FTDI_REPLY_STATUS   "\x32\x60"
 
 /* ---------------------------------------------------------------- */
@@ -88,11 +91,113 @@ static uint8_t ep0_buf[64];
 #define JTAG2_PIN_D7 -1
 #endif
 
+static void port_gpio_set_dir(struct jtag *jtag, uint8_t dir) {
+#ifdef DEBUG_GPIO
+  printf("port_gpio_set_dir(%d, 0x%02x)\n", PIO_INDEX(&jtag->pio), dir);
+#endif
+  
+  if(dir == jtag->pio.gpio_dir) return;
+
+  // enable the PIO if the direction of the lower four port pins matches the JTAG/SPI use case
+  pio_jtag_enable(&jtag->pio, (dir & 0x0f) == 0x0b);
+
+  // set lower pins direction if not in pio mode
+  if(!jtag->pio.pio_enabled) {
+    uint8_t low_pins[] = { jtag->pio.pin_tck, jtag->pio.pin_tdi, jtag->pio.pin_tdo, jtag->pio.pin_tms };
+    for(int i=0;i<4;i++) {
+      gpio_set_dir(low_pins[i], (dir&(1<<i))?GPIO_OUT:GPIO_IN);
+#ifdef DEBUG_GPIO
+      printf("GPIO%d/%d DIR = %s\n", i, low_pins[i], (dir&(1<<i))?"output":"input");
+#endif
+    }
+  }
+
+  // handle upper bits
+  for(int i=0;i<4;i++) {
+    if(jtag->pio.pins_upper[i]) {
+      gpio_put(jtag->pio.pins_upper[i], 0);  // TODO: Check why this is needed. Otherwise FPGA won't boot
+      gpio_set_dir(jtag->pio.pins_upper[i], (dir&(1<<(i+4)))?GPIO_OUT:GPIO_IN);
+#ifdef DEBUG_GPIO
+      printf("GPIO%d/%d DIR = %s\n", i+4, jtag->pio.pins_upper[i], (dir&(1<<(i+4)))?"output":"input");
+#endif	  
+    }
+  }    
+  jtag->pio.gpio_dir = dir;
+}
+
+static void port_gpio_set(struct jtag *jtag, uint8_t value) {
+#ifdef DEBUG_GPIO
+  printf("port_gpio_set(%d, 0x%02x)\n", PIO_INDEX(&jtag->pio), value);
+#endif
+  
+  // PIO is only used in JTAG/SPI compatible mode with direction of D0-D3 being 0x0b
+  if(jtag->pio.pio_enabled) {      
+    // this command also sets a certain state to the lower output pins
+    uint8_t ostate = 0;
+    if(value & (1<<0)) ostate |= PIO_JTAG_BIT_TCK;
+    if(value & (1<<1)) ostate |= PIO_JTAG_BIT_TDI;
+    // bit 2 is an input in JTAG/SPI mode and cannot be set this way
+    if(value & (1<<3)) ostate |= PIO_JTAG_BIT_TMS;
+#ifdef DEBUG_GPIO
+    printf("PIO GPIO = %d\n", ostate);
+#endif
+    pio_set_outputs(&jtag->pio, ostate);
+  } else {
+    // pio not active, set lower GPIO directly
+    uint8_t low_pins[] = { jtag->pio.pin_tck, jtag->pio.pin_tdi, jtag->pio.pin_tdo, jtag->pio.pin_tms };
+    for(int i=0;i<4;i++) {
+      if(jtag->pio.gpio_dir & (1<<i)) {
+#ifdef DEBUG_GPIO
+	printf("GPIO%d/%d = %d\n", i, low_pins[i], (value<<i)?1:0);
+#endif
+	gpio_put(low_pins[i], (value<<i)?1:0);
+      }
+    }
+  }
+    
+  // handle upper gpio if present
+  for(int i=0;i<4;i++) {
+    if(jtag->pio.pins_upper[i]) {
+      // set value id pin is configured as output
+      if(jtag->pio.gpio_dir & (1<<(i+4))) {
+	gpio_put(jtag->pio.pins_upper[i], (value&(1<<(i+4)))?1:0);
+#ifdef DEBUG_GPIO
+	printf("GPIO%d/%d = %d\n", i+4, jtag->pio.pins_upper[i], (value&(1<<(i+4)))?1:0);	    
+#endif
+      }
+    }
+#ifdef DEBUG_GPIO
+    else printf("\n");
+#endif
+  }
+}
+
+static uint8_t port_gpio_get(struct jtag *jtag) {
+  uint8_t low_pins[] = { jtag->pio.pin_tck, jtag->pio.pin_tdi, jtag->pio.pin_tdo, jtag->pio.pin_tms };
+  uint8_t retval = 0;
+
+  // read the state of the lower four bits which are otherwise controlled by the
+  // PIO engine
+  for(int i=0;i<4;i++)
+    if(gpio_get(low_pins[i])) retval |= (1<<i);
+  
+  // check state of upper four bits
+  for(int i=0;i<4;i++)
+    if(jtag->pio.pins_upper[i] != -1)
+      if(gpio_get(jtag->pio.pins_upper[i])) retval |= (1<<(4+i));
+
+#ifdef DEBUG_GPIO
+  printf("port_gpio_get(%d)=0x%02x\n", PIO_INDEX(&jtag->pio), retval);
+#endif
+  return retval;
+}
+
 // Struct defining the device configuration
 static struct usb_device_configuration dev_config = {
         .device_descriptor = &device_descriptor,
+#ifdef USB_HS
         .device_qualifier_descriptor = &device_qualifier_descriptor,
-
+#endif
 	.ports[0].jtag.pio.pio = pio0,
 	.ports[0].jtag.pio.sm = 0,
 	.ports[0].jtag.pio.pin_tck = JTAG1_PIN_TCK,
@@ -371,6 +476,7 @@ void usb_handle_device_descriptor(volatile struct usb_setup_packet *pkt) {
     usb_start_transfer(ep, (uint8_t *) d, MIN(sizeof(struct usb_device_descriptor), pkt->wLength));
 }
 
+#ifdef USB_HS
 void usb_handle_device_qualifier_descriptor(volatile struct usb_setup_packet *pkt) {
     const struct usb_device_qualifier_descriptor *d = dev_config.device_qualifier_descriptor;
     // EP0 in
@@ -379,6 +485,7 @@ void usb_handle_device_qualifier_descriptor(volatile struct usb_setup_packet *pk
     ep->next_pid = 1;
     usb_start_transfer(ep, (uint8_t *) d, MIN(sizeof(struct usb_device_qualifier_descriptor), pkt->wLength));
 }
+#endif
 
 /**
  * @brief Send the configuration descriptor (and potentially the configuration and endpoint descriptors) to the host.
@@ -394,7 +501,7 @@ void usb_handle_config_descriptor(volatile struct usb_setup_packet *pkt) {
     buf += sizeof(struct usb_configuration_descriptor);
 
     // If we more than just the config descriptor copy it all
-    if (pkt->wLength >= d->wTotalLength) {
+    //    if (pkt->wLength >= d->wTotalLength) {
       for (uint p = 0; p < 2; p++) {
 	// send both ports interface desciptors with both endpoints each
         memcpy((void *) buf, dev_config.ports[p].interface_descriptor, sizeof(struct usb_interface_descriptor));
@@ -404,7 +511,7 @@ void usb_handle_config_descriptor(volatile struct usb_setup_packet *pkt) {
 	memcpy((void *) buf, dev_config.ports[p].endpoints[1].descriptor, sizeof(struct usb_endpoint_descriptor));
 	buf += sizeof(struct usb_endpoint_descriptor);
       }
-    }
+      //    }
 
     // Send data
     // Get len by working out end of buffer subtract start of buffer
@@ -512,47 +619,47 @@ static uint16_t eeprom_dummy_data[256] = {
 
 void usb_handle_setup_packet(void) {
     volatile struct usb_setup_packet *pkt = (volatile struct usb_setup_packet *) &usb_dpram->setup_packet;
-    uint8_t req_direction = pkt->bmRequestType;
-    uint8_t req = pkt->bRequest;
 
     // Reset PID to 1 for EP0 IN
     usb_get_endpoint_configuration(EP0_IN_ADDR)->next_pid = 1u;
 
-    if (req_direction == USB_DIR_OUT) {
-        if (req == USB_REQUEST_SET_ADDRESS) {
+    if (pkt->bmRequestType == USB_DIR_OUT) {
+        if (pkt->bRequest == USB_REQUEST_SET_ADDRESS) {
             usb_set_device_address(pkt);
-        } else if (req == USB_REQUEST_SET_CONFIGURATION) {
+        } else if (pkt->bRequest == USB_REQUEST_SET_CONFIGURATION) {
             usb_set_device_configuration(pkt);
         } else {
 	    usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
             printf("Other OUT request (0x%x)\r\n", pkt->bRequest);
         }
-    } else if (req_direction == USB_DIR_IN) {
-        if (req == USB_REQUEST_GET_STATUS) {
+    } else if (pkt->bmRequestType == USB_DIR_IN) {
+        if (pkt->bRequest == USB_REQUEST_GET_STATUS) {
 	  usb_handle_status_request(pkt);
 	  
-        } else if (req == USB_REQUEST_GET_DESCRIPTOR) {
+        } else if (pkt->bRequest == USB_REQUEST_GET_DESCRIPTOR) {
             switch (pkt->wValue >> 8) {
                 case USB_DT_DEVICE:
                     usb_handle_device_descriptor(pkt);
-                    printf("GET DEVICE DESCRIPTOR\r\n");
+                    printf("GET DEVICE DESCRIPTOR 0x%04x/0x%02x %d\r\n", pkt->wIndex, pkt->wValue&0xff, pkt->wLength);
                     break;
 
                 case USB_DT_CONFIG:
                     usb_handle_config_descriptor(pkt);
-                    printf("GET CONFIG DESCRIPTOR\r\n");
+                    printf("GET CONFIG DESCRIPTOR 0x%04x/0x%02x %d\r\n", pkt->wIndex, pkt->wValue&0xff, pkt->wLength);
                     break;
 
                 case USB_DT_STRING:
                     usb_handle_string_descriptor(pkt);
-                    printf("GET STRING DESCRIPTOR\r\n");
+                    printf("GET STRING DESCRIPTOR 0x%04x/0x%02x %d\r\n", pkt->wIndex, pkt->wValue&0xff, pkt->wLength);
                     break;
 
+#ifdef USB_HS
 	        case USB_DT_DEVICE_QUALIFIER:
 		    usb_handle_device_qualifier_descriptor(pkt);
 		    printf("GET DEVICE QUALIFIER DESCRIPTOR\r\n");
 		    break;
-
+#endif
+		    
                 default:
 		    usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
                     printf("Unhandled GET_DESCRIPTOR type 0x%x\r\n", pkt->wValue >> 8);
@@ -561,15 +668,30 @@ void usb_handle_setup_packet(void) {
             printf("Other IN request (0x%x)\r\n", pkt->bRequest);
         }
     }
-    else if (req_direction == 0x40) {
-
+    
+    else if (pkt->bmRequestType == USB_VENDOR_OUT) {
       switch(pkt->bRequest) {
       case 0x00:
 	printf("FTDI RESET, #%d=%d\n", pkt->wIndex, pkt->wValue);
+
+	// TODO: check if this actually resets everything and returns to idle/all tristate
+	
 	break;
 
+      case 0x01:
+	printf("FTDI SET MODEM CONTROL, #%d=%d\n", pkt->wIndex, pkt->wValue);
+	break;
+	
+      case 0x02:
+	printf("FTDI SET FLOW CONTROL, #%d=%d\n", pkt->wIndex, pkt->wValue);
+	break;
+	
       case 0x03:
 	printf("FTDI SET BAUD RATE, #%d=%d\n", pkt->wIndex, pkt->wValue);
+	break;
+
+      case 0x04:
+	printf("FTDI SET DATA, #%d=%d\n", pkt->wIndex, pkt->wValue);
 	break;
 
       case 0x05:
@@ -586,22 +708,7 @@ void usb_handle_setup_packet(void) {
 	  struct jtag *jtag = &dev_config.ports[pkt->wIndex-1].jtag;
 	  
 	  jtag->mode = pkt->wValue>>8;
-
-	  // in bitbang mode setup the direction of the upper four bits
-	  jtag->gpio_dir = (pkt->wValue>>4)&0x0f;
-	    
-	  for(int i=0;i<4;i++) {
-	    if(jtag->pio.pins_upper[i]) {
-#ifdef DEBUG_GPIO
-	      printf("  GPIO %d:", jtag->pio.pins_upper[i]);
-#endif	  
-	      gpio_put(jtag->pio.pins_upper[i], 0);  // TODO: Check why this is needed. Otherwise FPGA won't boot
-	      gpio_set_dir(jtag->pio.pins_upper[i], (jtag->gpio_dir&(1<<i))?GPIO_OUT:GPIO_IN);
-#ifdef DEBUG_GPIO
-	      printf(" %s\n", (jtag->gpio_dir&(1<<i))?"output":"input");
-#endif
-	    }
-	  }	  
+	  port_gpio_set_dir(jtag, pkt->wValue & 0xff);
 	}
 	break;
 
@@ -617,12 +724,13 @@ void usb_handle_setup_packet(void) {
 	break;
 	
       default:
-	printf("Unsupported vendor out request %02x, #%d=%d\n", pkt->bRequest, pkt->wIndex, pkt->wValue);
+	printf("Unsupported vendor out request 0x%02x, #%d=%d\n", pkt->bRequest, pkt->wIndex, pkt->wValue);
 	break;	
       }
       usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
     }
-    else if (req_direction == 0xc0) {
+    
+    else if (pkt->bmRequestType == USB_VENDOR_IN) {
       switch(pkt->bRequest) {
       case 0x05:
 	printf("FTDI POLL MODEM STATUS\n");
@@ -631,7 +739,7 @@ void usb_handle_setup_packet(void) {
 	
       case 0x90: // read eeprom
 	if(pkt->wIndex < 256) {
-	  printf("FTDI READ EEPROM, #%d=%04x\n", pkt->wIndex, eeprom_dummy_data[pkt->wIndex]);
+	  printf("FTDI READ EEPROM, #%d=$%04x\n", pkt->wIndex, eeprom_dummy_data[pkt->wIndex]);
 	  usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), (uint8_t*)&(eeprom_dummy_data[pkt->wIndex]), 2);
 	} else {
 	  printf("FTDI READ EEPROM, #%d (out of range)\n", pkt->wIndex);
@@ -640,13 +748,20 @@ void usb_handle_setup_packet(void) {
 	break;
 	
       default:
-	printf("Unsupported vendor in request %02x, #%d=%d\n", pkt->bRequest, pkt->wIndex, pkt->wValue);
+	printf("Unsupported vendor in request 0x%02x, #%d=%d\n", pkt->bRequest, pkt->wIndex, pkt->wValue);
 	usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
 	break;
       }
-    } else
-      printf("Uknown request type %02x\n", pkt->bmRequestType);
-
+    } else {
+      static const char *types_str[] = { "Standard", "Class", "Vendor", "Reserved" };
+      static const char *recipient_str[] = { "Device", "Interface", "Endpoint", "Other" };      
+      printf("Unknown USB request type 0x%02x: %s %s %s\n", pkt->bmRequestType,
+	     types_str[(pkt->bmRequestType>>5)&0x03],
+	     ((pkt->bmRequestType&0x1f)<4)?recipient_str[pkt->bmRequestType&0x1f]:"Reserved",
+	     (pkt->bmRequestType&0x80)?"out":"in"
+	     );
+      usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
+    }
 }
 
 /**
@@ -808,72 +923,31 @@ static uint16_t mpsse_cmd_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
   case 0x80:
   case 0x82:
     if(len < 3) return 0;  // needs at least 3 bytes
-    printf("MPSSE: Set data bits %s value %02x, dir %02x=", (buf[0]&2)?"high":"low", buf[1], buf[2]);
+#ifdef DEBUG_MPSSE
+    printf("MPSSE: Set data bits %s value 0x%02x, dir 0x%02x=", (buf[0]&2)?"high":"low", buf[1], buf[2]);
     for(int i=0;i<8;i++) printf("%c", (buf[2]&(0x80>>i))?'O':'I');
     printf("\n");
+#endif
     
     /* we currently only support the lower bits */
     if(!(buf[0]&2)) {
-      // second payload byte is direction. Lowest bits 0x0b is JTAG (and SPI) mapping
-      pio_jtag_enable(&jtag->pio, (buf[2] & 0x0f) == 0x0b);
-
-      // PIO is only used in JTAG/SPI compatible mode with direction of D0-D3 being 0x0b
-      if((buf[2] & 0x0f) == 0x0b) {
-      
-	// this command also sets a certain state to the lower output pins
-	uint8_t ostate = 0;
-	if((buf[2] & (1<<0)) && (buf[1] & (1<<0))) ostate |= PIO_JTAG_BIT_TCK;
-	if((buf[2] & (1<<1)) && (buf[1] & (1<<1))) ostate |= PIO_JTAG_BIT_TDI;
-	// bit 2 is an input in JTAG/SPI mode and cannot be set this way
-	if((buf[2] & (1<<3)) && (buf[1] & (1<<3))) ostate |= PIO_JTAG_BIT_TMS;
-#ifdef DEBUG_GPIO
-	printf("SET PIO GPIO %02x\n", ostate);
-#endif
-	pio_set_outputs(&jtag->pio, ostate);
-      }
-      
-      // handle upper gpio if present
-      for(int i=0;i<4;i++) {
-	if(jtag->pio.pins_upper[i]) {
-#ifdef DEBUG_GPIO
-	  printf("  GPIO %d:", jtag->pio.pins_upper[i]);
-#endif	  
-	  gpio_put(jtag->pio.pins_upper[i], 0);  // TODO: Check why this is needed. Otherwise FPGA won't boot
-	  gpio_set_dir(jtag->pio.pins_upper[i], (buf[2]&(1<<(i+4)))?GPIO_OUT:GPIO_IN);
-#ifdef DEBUG_GPIO
-	  printf(" %s", (buf[2]&(1<<(i+4)))?"output":"input");
-#endif	  
-
-	  // set value id pin is configured as output
-	  if(buf[2]&(1<<(i+4))) {
-	    gpio_put(jtag->pio.pins_upper[i], (buf[1]&(1<<(i+4)))?1:0);
-#ifdef DEBUG_GPIO
-	    printf(" = %d\n", (buf[1]&(1<<(i+4)))?1:0);	    
-#endif	  
-	  }
-#ifdef DEBUG_GPIO
-	  else printf("\n");
-#endif	  
-	}
-      }
+      // second payload byte is direction. Lowest bits 0xb is JTAG (and SPI) mapping
+      port_gpio_set_dir(jtag, buf[2]);
+      port_gpio_set(jtag, buf[1]);
     }
     return 3;
                 
   case 0x81:
   case 0x83:
-    printf("MPSSE: Get data bits %s\n", (buf[0]&2)?"high":"low");
-
     // send input state in a reply byte
     uint8_t reply = 0;
 
-    // check the TDO state. TCK, TDI and TMS are outputs
-    if(gpio_get(jtag->pio.pin_tdo)) reply |= (1<<2);
-
-    // check state of upper four bits
-    for(int i=0;i<4;i++)
-      if((jtag->pio.pins_upper[i] != -1) && !(jtag->gpio_dir & (1<<i)))
-	if(gpio_get(jtag->pio.pins_upper[i])) reply |= (1<<(4+i));
-
+    // only low byte supported
+    if(!(buf[0]&2)) reply = port_gpio_get(jtag);
+      
+#ifdef DEBUG_MPSSE
+    printf("MPSSE: Get data bits %s: 0x%02x\n", (buf[0]&2)?"high":"low", reply);
+#endif
     jtag->reply_buffer[jtag->reply_len+2] = reply;
     jtag->reply_len += 1;
     
@@ -881,32 +955,44 @@ static uint16_t mpsse_cmd_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
     break;
     
   case 0x84:
+#ifdef DEBUG_MPSSE
     printf("MPSSE: Connect loopback\n");
+#endif
     return 1;
 
   case 0x85:
+#ifdef DEBUG_MPSSE
     printf("MPSSE: Disconnect loopback\n");
+#endif
     return 1;
 
   case 0x86: {
     if(len < 3) return 0;  // needs at least 3 bytes    
     int divisor = buf[1] + 256*buf[2];
     int rate = 12000000 / ((1+divisor) * 2);
-    printf("MPSSE: Set TCK/SK Divisor to %d = %d Mhz\n", divisor, rate/1000000);
-    pio_jtag_set_clk_freq(&jtag->pio, rate/1000);    
+#ifdef DEBUG_MPSSE
+    printf("MPSSE: Set PIO %d TCK/SK Divisor to %d = %d Mhz\n", PIO_INDEX(&jtag->pio), divisor, rate/1000000);
+#endif
+    pio_jtag_set_clk_freq(&jtag->pio, rate/1000);
     return 3;
   }
 
   case 0x87:
-    // printf("MPSSE: Flush\n");
+#ifdef DEBUG_MPSSE
+    printf("MPSSE: Flush\n");
+#endif
     return 1;
 
   case 0x8a:
+#ifdef DEBUG_MPSSE
     printf("MPSSE: Disable div by 5 (60MHz master clock)\n");
+#endif
     return 1;
         
   case 0x8b:
+#ifdef DEBUG_MPSSE
     printf("MPSSE: Enable div by 5 (12MHz master clock)\n");
+#endif
     return 1;
 
   }
@@ -962,6 +1048,7 @@ static uint16_t mpsse_shift_parse(struct jtag *jtag, uint8_t *buf, uint16_t len)
 
 #ifdef DEBUG_SHIFT
     printf("MPSSE: shift %d bits\n", shift_len);
+    hexdump(buf, (shift_len+7)/8);
 #endif
 
     if(cmd & 0x40) {
@@ -990,11 +1077,14 @@ static uint16_t mpsse_shift_parse(struct jtag *jtag, uint8_t *buf, uint16_t len)
   
 #ifdef DEBUG_SHIFT
   printf("MPSSE: shift %d bytes (%d avail)\n", shift_len, len-3);
+  hexdump(buf+3, shift_len);
 #endif
 
   // it may happen that we are supposed to shift out more bits than we have payload
   if((cmd & 0x10) && (3+shift_len > len)) {
-    // printf("---------------------> truncating write %d to %d\n", shift_len, len-3);
+#ifdef DEBUG_TRUNCATION
+    printf("Trunc write %d to %d\n", shift_len, len-3);
+#endif
 
     pio_jtag_write_tdi_read_tdo(&jtag->pio, (cmd&8)?1:0, buf+3,
 	    (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL,(len-3)*8);
@@ -1047,7 +1137,9 @@ static void check_for_outgoing_data(struct jtag *jtag) {
     }
     jtag->tx_pending = true;
   } else {
-    // printf("REPLY: no pending data\n");
+#ifdef DEBUG_REPLY
+    printf("REPLY: no pending data\n");
+#endif
     
     usb_start_transfer(usb_get_endpoint_configuration(jtag->eps[0]), FTDI_REPLY_STATUS, 2);    
     jtag->tx_pending = true;
@@ -1072,14 +1164,7 @@ static void mpsse_parse_all(struct jtag *jtag, uint8_t *buf, uint16_t len) {
   if(jtag->mode == 1) {
     printf("BITBANG\n");
 
-    // handle upper four bits
-    for(int i=0;i<4;i++) {
-      if((jtag->pio.pins_upper[i] != -1) && jtag->gpio_dir & (1<<i)) {	
-	printf("drive %d to %d\n", 4+i, buf[0] & (1<<(i+4))?1:0);
-	gpio_put(jtag->pio.pins_upper[i], (buf[0]&(1<<(i+4)))?1:0);
-      }
-    }
-
+    port_gpio_set(jtag, buf[0]);
     // TODO: return input state
   }
   
@@ -1088,7 +1173,9 @@ static void mpsse_parse_all(struct jtag *jtag, uint8_t *buf, uint16_t len) {
     // check if there are remaining bytes to shift from previous request
     if(jtag->pending_writes) {
       uint16_t bytes2shift = (len < jtag->pending_writes)?len:jtag->pending_writes;
-      // printf("--> add %d of %d\n", bytes2shift, jtag->pending_writes);
+#ifdef DEBUG_TRUNCATION
+      printf("--> add %d of %d\n", bytes2shift, jtag->pending_writes);
+#endif
       
       pio_jtag_write_tdi_read_tdo(&jtag->pio, (jtag->pending_write_cmd&8)?1:0, buf,
 			      (jtag->pending_write_cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL,
@@ -1160,7 +1247,7 @@ void ep4_out_handler(uint8_t *buf, uint16_t len) {
 }
 
 void jtag_init(pio_jtag_inst_t* jtag_pio) {
-  printf(">> Initializing PIO JTAG #%d <<\n", (jtag_pio->pio == pio0)?1:2);
+  printf(">> Initializing PIO JTAG #%d <<\n", PIO_INDEX(jtag_pio));
   
   pio_jtag_init(jtag_pio, 1000);      // initially go with 1 Mhz TCK clock
   pio_jtag_enable(jtag_pio, false);   // start with jtag disabled and the JTAG pins switched to input

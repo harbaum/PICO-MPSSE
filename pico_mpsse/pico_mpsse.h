@@ -37,7 +37,6 @@ struct jtag {
   uint16_t pending_writes;
   uint8_t pending_write_cmd;
   uint8_t mode;  // 2=MPSSE
-  uint8_t gpio_dir;
   pio_jtag_inst_t pio;
 };
 
@@ -54,7 +53,9 @@ struct usb_device_configuration {
   } ports[2];
   
   const struct usb_configuration_descriptor *config_descriptor;
+#ifdef USB_HS
   const struct usb_device_qualifier_descriptor *device_qualifier_descriptor;
+#endif
   const unsigned char *lang_descriptor;
   const unsigned char **descriptor_strings;
   struct usb_endpoint_configuration endpoints[2];
@@ -90,7 +91,7 @@ static const struct usb_endpoint_descriptor ep0_in = {
 static const struct usb_device_descriptor device_descriptor = {
         .bLength         = sizeof(struct usb_device_descriptor),
         .bDescriptorType = USB_DT_DEVICE,
-        .bcdUSB          = 0x0200, // USB 2.0 device
+        .bcdUSB          = 0x0110, // USB 1.1 device
         .bDeviceClass    = 0,      // Specified in interface descriptor
         .bDeviceSubClass = 0,      // No subclass
         .bDeviceProtocol = 0,      // No protocol
@@ -104,6 +105,7 @@ static const struct usb_device_descriptor device_descriptor = {
         .bNumConfigurations = 1    // One configuration
 };
 
+#ifdef USB_HS
 static const struct usb_device_qualifier_descriptor device_qualifier_descriptor = {
         .bLength         = sizeof(struct usb_device_qualifier_descriptor),
         .bDescriptorType = USB_DT_DEVICE_QUALIFIER,
@@ -115,6 +117,7 @@ static const struct usb_device_qualifier_descriptor device_qualifier_descriptor 
         .bNumConfigurations = 1,   // One configuration
 	.bRESERVED       = 0
 };
+#endif
 
 static const struct usb_interface_descriptor interface_descriptor_p0 = {
         .bLength            = sizeof(struct usb_interface_descriptor),
@@ -134,7 +137,7 @@ static const struct usb_endpoint_descriptor ep1_in = {
         .bEndpointAddress = EP1_IN_ADDR,
         .bmAttributes     = USB_TRANSFER_TYPE_BULK,
         .wMaxPacketSize   = MAX_PKT_SIZE,
-        .bInterval        = 0
+        .bInterval        = 1
 };
 
 static const struct usb_endpoint_descriptor ep2_out = {
@@ -143,7 +146,7 @@ static const struct usb_endpoint_descriptor ep2_out = {
         .bEndpointAddress = EP2_OUT_ADDR,
         .bmAttributes     = USB_TRANSFER_TYPE_BULK,
         .wMaxPacketSize   = MAX_PKT_SIZE,
-        .bInterval        = 0
+        .bInterval        = 1
 };
 
 static const struct usb_interface_descriptor interface_descriptor_p1 = {
@@ -164,7 +167,7 @@ static const struct usb_endpoint_descriptor ep3_in = {
         .bEndpointAddress = EP3_IN_ADDR,
         .bmAttributes     = USB_TRANSFER_TYPE_BULK,
         .wMaxPacketSize   = MAX_PKT_SIZE,
-        .bInterval        = 0
+        .bInterval        = 1
 };
 
 static const struct usb_endpoint_descriptor ep4_out = {
@@ -173,7 +176,7 @@ static const struct usb_endpoint_descriptor ep4_out = {
         .bEndpointAddress = EP4_OUT_ADDR,
         .bmAttributes     = USB_TRANSFER_TYPE_BULK,
         .wMaxPacketSize   = MAX_PKT_SIZE,
-        .bInterval        = 0
+        .bInterval        = 1
 };
 
 static const struct usb_configuration_descriptor config_descriptor = {

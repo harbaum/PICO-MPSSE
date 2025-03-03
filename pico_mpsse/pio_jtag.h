@@ -5,11 +5,16 @@
 #include "hardware/pio.h"
 #include "hardware/dma.h"
 
+#define PIO_INDEX(a)  (((a)->pio==pio0)?0:1)
+
 typedef struct pio_jtag_inst {
   PIO pio;
   uint sm;
   uint pin_tck, pin_tdi, pin_tdo, pin_tms;
   uint pins_upper[4];
+
+  bool pio_enabled;
+  uint8_t gpio_dir;
   
   int tx_dma_chan;
   int rx_dma_chan;

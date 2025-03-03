@@ -14,7 +14,7 @@ static void dma_init(pio_jtag_inst_t* jtag) {
   jtag->tx_c = dma_channel_get_default_config(jtag->tx_dma_chan);
   channel_config_set_transfer_data_size(&jtag->tx_c, DMA_SIZE_8);
   channel_config_set_read_increment(&jtag->tx_c, true);
-  channel_config_set_dreq(&jtag->tx_c, (jtag->pio==pio0)?DREQ_PIO0_TX0:DREQ_PIO1_TX0);
+  channel_config_set_dreq(&jtag->tx_c, PIO_INDEX(jtag)?DREQ_PIO1_TX0:DREQ_PIO0_TX0);
   dma_channel_configure(
 			jtag->tx_dma_chan,
 			&jtag->tx_c,
@@ -30,7 +30,7 @@ static void dma_init(pio_jtag_inst_t* jtag) {
   channel_config_set_transfer_data_size(&jtag->rx_c, DMA_SIZE_8);
   channel_config_set_write_increment(&jtag->rx_c, false);
   channel_config_set_read_increment(&jtag->rx_c, false);
-  channel_config_set_dreq(&jtag->rx_c, (jtag->pio==pio0)?DREQ_PIO0_RX0:DREQ_PIO1_RX0);
+  channel_config_set_dreq(&jtag->rx_c, PIO_INDEX(jtag)?DREQ_PIO1_RX0:DREQ_PIO0_RX0);
   dma_channel_configure(
 			jtag->rx_dma_chan,
 			&jtag->rx_c,
@@ -42,6 +42,16 @@ static void dma_init(pio_jtag_inst_t* jtag) {
 }
 
 void pio_set_outputs(pio_jtag_inst_t *jtag, uint8_t bits) {
+  // TODO: Check if pio_sm_set_pins_with_mask would do this job as well
+  
+  // wait now, if we've received further data via USB and the last PIO transfer is still in progress
+  if(jtag->write_pending) {
+    while (dma_channel_is_busy(jtag->rx_dma_chan))
+      tight_loop_contents();
+    
+    jtag->write_pending = false;
+  }
+
   // make sure there's space to send further data into tx fifo
   while(pio_sm_is_tx_fifo_full(jtag->pio, jtag->sm))
     tight_loop_contents();
@@ -57,6 +67,13 @@ static void __time_critical_func(pio_jtag_blocking)(pio_jtag_inst_t *jtag, const
   io_rw_8 *txfifo = (io_rw_8 *) &jtag->pio->txf[jtag->sm];
   static uint8_t x; // scratch local to receive data if no receive buffer is provided
 
+  if(!jtag->pio_enabled) {
+    // the pio must be enabled to actually shift data. This happens if e.g. data is being
+    // sent in loopback mode as MPSSE is not setup then    
+    printf("---------> WARNING, PIO %d is not enabled\n", PIO_INDEX(jtag));
+    return;
+  }
+  
   // wait now, if we've received further data via USB and the last PIO transfer is still in progress
   if(jtag->write_pending) {
     while (dma_channel_is_busy(jtag->rx_dma_chan))
@@ -107,10 +124,9 @@ void pio_jtag_set_clk_freq(pio_jtag_inst_t *jtag, uint freq_khz) {
   pio_sm_set_clkdiv_int_frac(jtag->pio, jtag->sm, jtag_get_clk_divider(freq_khz), 0);
 }
 
-// tdi bits "exanded" for interleaved tdi/tms tranmission
+// tdi bits "expanded" for interleaved tdi/tms tranmission
 static uint16_t interleave_table[256];
 
-// TODO: include this into the interleave calculation 
 static uint8_t bit_reverse_u8(uint8_t byte) {
   byte = ((byte & 0x55) << 1) | ((byte & 0xaa) >> 1);
   byte = ((byte & 0x33) << 2) | ((byte & 0xcc) >> 2);
@@ -120,25 +136,48 @@ static uint8_t bit_reverse_u8(uint8_t byte) {
 }
 
 void pio_jtag_enable(pio_jtag_inst_t* jtag, bool enable) {
+  printf("PIO #%d %sable\n", PIO_INDEX(jtag), enable?"en":"dis");
+  if(jtag->pio_enabled == enable) return;  
+  pio_sm_set_enabled(jtag->pio, jtag->sm, enable);
+
   if(enable) {
-    printf("JTAG #%d ENABLE\n", (jtag->pio==pio0)?0:1);
-    int gpio_func_pio = (jtag->pio == pio0)?GPIO_FUNC_PIO0:GPIO_FUNC_PIO1;
+    int gpio_func_pio = PIO_INDEX(jtag)?GPIO_FUNC_PIO1:GPIO_FUNC_PIO0;
     gpio_set_function(jtag->pin_tdi, gpio_func_pio);
     gpio_set_function(jtag->pin_tms, gpio_func_pio);
     gpio_set_function(jtag->pin_tck, gpio_func_pio);
   } else {    
-    printf("JTAG #%d DISABLE\n", (jtag->pio==pio0)?0:1);
-    // revert to bitbang and make all pins inputs to make them tristate
+    // revert to bitbang and set pin direction as requested
+#if 1
+    // remember last state of TMS and TDI and restore these as well
+    gpio_put(jtag->pin_tck, gpio_get(jtag->pin_tck));
+    gpio_set_function(jtag->pin_tck, GPIO_FUNC_SIO);
+    gpio_set_dir(jtag->pin_tck, (jtag->gpio_dir&(1<<0))?GPIO_OUT:GPIO_IN);
+
+    gpio_put(jtag->pin_tdi, gpio_get(jtag->pin_tdi));
+    gpio_set_function(jtag->pin_tdi, GPIO_FUNC_SIO);
+    gpio_set_dir(jtag->pin_tdi, (jtag->gpio_dir&(1<<1))?GPIO_OUT:GPIO_IN);
+
+    // gpio 2 is input
+    
+    gpio_put(jtag->pin_tms, gpio_get(jtag->pin_tms));
+    gpio_set_function(jtag->pin_tms, GPIO_FUNC_SIO);
+    gpio_set_dir(jtag->pin_tms, (jtag->gpio_dir&(1<<3))?GPIO_OUT:GPIO_IN);
+    
+#else
+    printf("Switching PIO to all inputs\n");
     gpio_set_function(jtag->pin_tdi, GPIO_FUNC_SIO); gpio_set_dir(jtag->pin_tdi, GPIO_IN);
     gpio_set_function(jtag->pin_tms, GPIO_FUNC_SIO); gpio_set_dir(jtag->pin_tms, GPIO_IN);
-    gpio_set_function(jtag->pin_tck, GPIO_FUNC_SIO); gpio_set_dir(jtag->pin_tck, GPIO_IN); 
+    gpio_set_function(jtag->pin_tck, GPIO_FUNC_SIO); gpio_set_dir(jtag->pin_tck, GPIO_IN);
+#endif
   }
+  jtag->pio_enabled = enable;
 }
     
 void pio_jtag_init(pio_jtag_inst_t* jtag, uint freq) {
   uint16_t clkdiv = jtag_get_clk_divider(freq);   // clkdiv = 31;  // around 1 MHz @ 125MHz clk_sys
   pio_jtag_io_init(jtag->pio, jtag->sm, clkdiv, jtag->pin_tck, jtag->pin_tdi, jtag->pin_tms, jtag->pin_tdo);
   dma_init(jtag);    
+  jtag->pio_enabled = true;
   
   // Setup the interleave table. This does two things:
   // - it expands with every second bit being 0

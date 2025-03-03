@@ -23,6 +23,11 @@ target_link_libraries(${PROJECT} PRIVATE
      pico_unique_id
 )
 
+# Add extra outputs for the "test" target (e.g., UF2 file)
+pico_add_extra_outputs(${PROJECT})
+pico_enable_stdio_usb(${PROJECT} 0)
+pico_enable_stdio_uart(${PROJECT} 1)
+
 add_custom_target(flash
     COMMAND echo "Flashing ${PROJECT} ..."
     COMMAND openocd -f interface/cmsis-dap.cfg -f target/rp2040.cfg -c "adapter speed 5000" -c "program ${PROJECT}.elf verify reset exit"
