@@ -17,7 +17,7 @@ programmed using a Raspberry Pi Pico and bypassing the on-board ft2232.
 ## Current state
 
 The device implements a very basic MPSSE sufficient to be used for two
-JTAG ports as present on ftx232 like devices as well. It also
+JTAG or SPI ports as present on ftx232 like devices as well. It also
 implements parts of the BITBANG mode and the GPIO handling to allow to
 use ports BD[4-7] and AD[4-7] to generate control signals. The efinix
 FPGAs e.g. use pin AD[4] to control the FPGAs CRESET signal.
