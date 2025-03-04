@@ -32,7 +32,7 @@ struct usb_endpoint_configuration {
 struct jtag {
   bool tx_pending;
   uint8_t reply_len;
-  uint8_t reply_buffer[1024];
+  uint8_t reply_buffer[256];
   uint8_t eps[2];
   uint16_t pending_writes;
   uint8_t pending_write_cmd;

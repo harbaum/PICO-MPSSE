@@ -92,10 +92,7 @@ static uint8_t ep0_buf[64];
 #endif
 
 static void port_gpio_set_dir(struct jtag *jtag, uint8_t dir) {
-#ifdef DEBUG_GPIO
-  printf("port_gpio_set_dir(%d, 0x%02x)\n", PIO_INDEX(&jtag->pio), dir);
-#endif
-  
+  // check if any direction bits have changed at all
   if(dir == jtag->pio.gpio_dir) return;
 
   // enable the PIO if the direction of the lower four port pins matches the JTAG/SPI use case
@@ -107,7 +104,7 @@ static void port_gpio_set_dir(struct jtag *jtag, uint8_t dir) {
     for(int i=0;i<4;i++) {
       gpio_set_dir(low_pins[i], (dir&(1<<i))?GPIO_OUT:GPIO_IN);
 #ifdef DEBUG_GPIO
-      printf("GPIO%d/%d DIR = %s\n", i, low_pins[i], (dir&(1<<i))?"output":"input");
+      printf("#%d GPIO%d DIR = %s\n", i, low_pins[i], (dir&(1<<i))?"output":"input");
 #endif
     }
   }
@@ -115,10 +112,9 @@ static void port_gpio_set_dir(struct jtag *jtag, uint8_t dir) {
   // handle upper bits
   for(int i=0;i<4;i++) {
     if(jtag->pio.pins_upper[i]) {
-      gpio_put(jtag->pio.pins_upper[i], 0);  // TODO: Check why this is needed. Otherwise FPGA won't boot
       gpio_set_dir(jtag->pio.pins_upper[i], (dir&(1<<(i+4)))?GPIO_OUT:GPIO_IN);
 #ifdef DEBUG_GPIO
-      printf("GPIO%d/%d DIR = %s\n", i+4, jtag->pio.pins_upper[i], (dir&(1<<(i+4)))?"output":"input");
+      printf("#%d GPIO%d DIR = %s\n", i+4, jtag->pio.pins_upper[i], (dir&(1<<(i+4)))?"output":"input");
 #endif	  
     }
   }    
@@ -126,10 +122,6 @@ static void port_gpio_set_dir(struct jtag *jtag, uint8_t dir) {
 }
 
 static void port_gpio_set(struct jtag *jtag, uint8_t value) {
-#ifdef DEBUG_GPIO
-  printf("port_gpio_set(%d, 0x%02x)\n", PIO_INDEX(&jtag->pio), value);
-#endif
-  
   // PIO is only used in JTAG/SPI compatible mode with direction of D0-D3 being 0x0b
   if(jtag->pio.pio_enabled) {      
     // this command also sets a certain state to the lower output pins
@@ -148,7 +140,7 @@ static void port_gpio_set(struct jtag *jtag, uint8_t value) {
     for(int i=0;i<4;i++) {
       if(jtag->pio.gpio_dir & (1<<i)) {
 #ifdef DEBUG_GPIO
-	printf("GPIO%d/%d = %d\n", i, low_pins[i], (value<<i)?1:0);
+	printf("#%d GPIO%d = %d\n", i, low_pins[i], (value<<i)?1:0);
 #endif
 	gpio_put(low_pins[i], (value<<i)?1:0);
       }
@@ -162,7 +154,7 @@ static void port_gpio_set(struct jtag *jtag, uint8_t value) {
       if(jtag->pio.gpio_dir & (1<<(i+4))) {
 	gpio_put(jtag->pio.pins_upper[i], (value&(1<<(i+4)))?1:0);
 #ifdef DEBUG_GPIO
-	printf("GPIO%d/%d = %d\n", i+4, jtag->pio.pins_upper[i], (value&(1<<(i+4)))?1:0);	    
+	printf("#%d GPIO%d = %d\n", i+4, jtag->pio.pins_upper[i], (value&(1<<(i+4)))?1:0);	    
 #endif
       }
     }
@@ -186,9 +178,6 @@ static uint8_t port_gpio_get(struct jtag *jtag) {
     if(jtag->pio.pins_upper[i] != -1)
       if(gpio_get(jtag->pio.pins_upper[i])) retval |= (1<<(4+i));
 
-#ifdef DEBUG_GPIO
-  printf("port_gpio_get(%d)=0x%02x\n", PIO_INDEX(&jtag->pio), retval);
-#endif
   return retval;
 }
 
@@ -216,13 +205,13 @@ static struct usb_device_configuration dev_config = {
 	    .handler = &ep1_in_handler,
 	    .endpoint_control = &usb_dpram->ep_ctrl[0].in,
 	    .buffer_control = &usb_dpram->ep_buf_ctrl[1].in,
-	    .data_buffer = &usb_dpram->epx_data[0 * 512],
+	    .data_buffer = &usb_dpram->epx_data[0 * MAX_PKT_SIZE],
 	  }, {
 	    .descriptor = &ep2_out,
 	    .handler = &ep2_out_handler,
 	    .endpoint_control = &usb_dpram->ep_ctrl[1].out,
 	    .buffer_control = &usb_dpram->ep_buf_ctrl[2].out,
-	    .data_buffer = &usb_dpram->epx_data[1 * 512],
+	    .data_buffer = &usb_dpram->epx_data[1 * MAX_PKT_SIZE],
 	  } },
 	
 	.ports[1].jtag.pio.pio = pio1,
@@ -243,13 +232,13 @@ static struct usb_device_configuration dev_config = {
 	    .handler = &ep3_in_handler,
 	    .endpoint_control = &usb_dpram->ep_ctrl[2].in,
 	    .buffer_control = &usb_dpram->ep_buf_ctrl[3].in,
-	    .data_buffer = &usb_dpram->epx_data[2 * 512],
+	    .data_buffer = &usb_dpram->epx_data[2 * MAX_PKT_SIZE],
 	  }, {
 	    .descriptor = &ep4_out,
 	    .handler = &ep4_out_handler,
 	    .endpoint_control = &usb_dpram->ep_ctrl[3].out,
 	    .buffer_control = &usb_dpram->ep_buf_ctrl[4].out,
-	    .data_buffer = &usb_dpram->epx_data[3 * 512],
+	    .data_buffer = &usb_dpram->epx_data[3 * MAX_PKT_SIZE],
 	  } },
 	
         .config_descriptor = &config_descriptor,
@@ -1146,26 +1135,14 @@ static void check_for_outgoing_data(struct jtag *jtag) {
   }
 }
 
-// pending outgoing data has been sent to host
-void ep1_in_handler(__unused uint8_t *buf, uint16_t len) {
-  // EP1 handles incoming data for port 0
-  struct jtag *jtag = &dev_config.ports[0].jtag;
-  
-#ifdef DEBUG_BULK0
-  printf("EP1 >>>>>>>>>> Sent %d bytes to host\n", len);
-  hexdump(buf, len);
-#endif
-
-  jtag->tx_pending = false;
-  check_for_outgoing_data(jtag);
-}
-
 static void mpsse_parse_all(struct jtag *jtag, uint8_t *buf, uint16_t len) {
   if(jtag->mode == 1) {
     printf("BITBANG\n");
 
     port_gpio_set(jtag, buf[0]);
-    // TODO: return input state
+    // return input state
+    jtag->reply_buffer[jtag->reply_len + 2] = port_gpio_get(jtag);
+    jtag->reply_len += 1;
   }
   
   // check if this port is in mpsse mode at all
@@ -1199,11 +1176,29 @@ static void mpsse_parse_all(struct jtag *jtag, uint8_t *buf, uint16_t len) {
     printf("Ignoring DATA in default mode\n");
     hexdump(buf, len);
   }
-    
-  //  if(len) printf("---------------- leftover %d ----------------\n", len);
+}
+
+// pending outgoing data has been sent to host
+void ep1_in_handler(__unused uint8_t *buf, uint16_t len) {
+  gpio_put(PICO_DEFAULT_LED_PIN, 1);
+  
+  // EP1 handles incoming data for port 0
+  struct jtag *jtag = &dev_config.ports[0].jtag;
+  
+#ifdef DEBUG_BULK0
+  printf("EP1 >>>>>>>>>> Sent %d bytes to host\n", len);
+  hexdump(buf, len);
+#endif
+
+  jtag->tx_pending = false;
+  check_for_outgoing_data(jtag);
+
+  gpio_put(PICO_DEFAULT_LED_PIN, 0);
 }
 
 void ep2_out_handler(uint8_t *buf, uint16_t len) {
+  gpio_put(PICO_DEFAULT_LED_PIN, 1);
+  
   // EP2 handles outgoing data for port 0
   struct jtag *jtag = &dev_config.ports[0].jtag;
 
@@ -1216,9 +1211,13 @@ void ep2_out_handler(uint8_t *buf, uint16_t len) {
   
   // re-enable receiver
   usb_start_transfer(usb_get_endpoint_configuration(EP2_OUT_ADDR), NULL, 64);
+
+  gpio_put(PICO_DEFAULT_LED_PIN, 0);
 }
 
 void ep3_in_handler(__unused uint8_t *buf, uint16_t len) {
+  gpio_put(PICO_DEFAULT_LED_PIN, 1);
+  
   // EP3 handles incoming data for port 1
   struct jtag *jtag = &dev_config.ports[1].jtag;
 
@@ -1229,9 +1228,13 @@ void ep3_in_handler(__unused uint8_t *buf, uint16_t len) {
   
   jtag->tx_pending = false;
   check_for_outgoing_data(jtag);
+
+  gpio_put(PICO_DEFAULT_LED_PIN, 0);
 }
 
 void ep4_out_handler(uint8_t *buf, uint16_t len) {
+  gpio_put(PICO_DEFAULT_LED_PIN, 1);
+
   // EP4 handles outgoing data for port 1
   struct jtag *jtag = &dev_config.ports[1].jtag;
 
@@ -1244,6 +1247,8 @@ void ep4_out_handler(uint8_t *buf, uint16_t len) {
   
   // re-enable receiver
   usb_start_transfer(usb_get_endpoint_configuration(EP4_OUT_ADDR), NULL, 64);
+
+  gpio_put(PICO_DEFAULT_LED_PIN, 0);
 }
 
 void jtag_init(pio_jtag_inst_t* jtag_pio) {
@@ -1271,7 +1276,11 @@ int main(void) {
 
   stdio_init_all();
   printf("<<<<<<<<<<<<<<<<< Pico MPSSE >>>>>>>>>>>>>>>>>>\n");
-    
+
+  gpio_init(PICO_DEFAULT_LED_PIN);
+  gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+  gpio_put(PICO_DEFAULT_LED_PIN, 1);
+
   jtag_init(&dev_config.ports[0].jtag.pio);
   jtag_init(&dev_config.ports[1].jtag.pio);
 
@@ -1287,6 +1296,9 @@ int main(void) {
   // Get ready to rx from host
   usb_start_transfer(usb_get_endpoint_configuration(EP2_OUT_ADDR), NULL, 64);
   usb_start_transfer(usb_get_endpoint_configuration(EP4_OUT_ADDR), NULL, 64);
+
+  // led off
+  gpio_put(PICO_DEFAULT_LED_PIN, 0);
   
   // Everything is interrupt driven so just loop here
   while(1) tight_loop_contents();

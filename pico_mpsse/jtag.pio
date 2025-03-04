@@ -16,30 +16,13 @@
 ; transitions on the trailing edge, or some time before the first leading edge.
 restart:
     pull                        ; get length-1 and disregard previous OSR state 
-    out y, 1                    ; this moves the first bit into Y	
-    jmp y-- setbits             ; check if setting single bits without clocking is requested
-    out x, 31                   ; this moves the remaining 31 bits into X	
+    out x, 32                   ; this moves all bits 32 bits into X	
 loop:
-    out pins, 2                 ; Stall here on empty (sideset proceeds even if instruction stalls, so we stall with TCK low
+    out pins, 2                  ; Stall here on empty (sideset proceeds even if instruction stalls, so we stall with TCK low
     nop             side 1      ; raise TCK
     in pins, 1                  ; sample TDO
     jmp x-- loop    side 0      ; lower TCK
     push                        ; Force the last ISR bits to be pushed to the tx fifo
-    jmp restart
-
-; A command has been received to set the three output bits individually. This is
-; used whenever the MPSSE "Set data bits" command is being used. This usually isn't
-; used in JTAG mode. But e.g. when talking to SPI components the CS signal may be
-; controlled this way.
-setbits:
-    out y, 1                    ; read requested TCK state
-    jmp y-- tck_high
-    nop             side 0      ; lower TCK
-    jmp do_tdi_tms
-tck_high:
-    nop             side 1      ; raise TCK
-do_tdi_tms:
-    out pins, 2                 ; set TDI and TMS directly
 
 % c-sdk {
 #include "hardware/gpio.h"
@@ -57,7 +40,7 @@ static inline void pio_jtag_io_init(PIO pio, uint sm,
     sm_config_set_in_shift(&c, false, true, 8);
     sm_config_set_clkdiv_int_frac(&c, clkdiv, 0);
 
-    // TDI, TCK output are low, TMS output is high, TDO is input
+    // TDI/DI, TCK/SCK output are low, TMS/CS output is high, TDO/DO is input
     pio_sm_set_pins_with_mask(pio, sm, (1u << pin_tms), (1u << pin_tck) | (1u << pin_tdi) | (1u << pin_tms));
     pio_sm_set_pindirs_with_mask(pio, sm, (1u << pin_tck) | (1u << pin_tdi) | (1u << pin_tms),
     				      (1u << pin_tck) | (1u << pin_tdi) | (1u << pin_tms) | (1u << pin_tdo));

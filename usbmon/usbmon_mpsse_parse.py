@@ -11,8 +11,6 @@
 # https://github.com/radupotop/usbmon
 # https://github.com/lipro/libftdi/blob/master/src/ftdi.h
 
-# TODO: handle both ports seperately
-
 import sys
 
 print("USBMON MPSSE parser")
@@ -640,6 +638,10 @@ def parse_bulk_out_mpsse(data):
         print("Set Data Bits","low" if data[0] == 0x80 else "high","byte value", hex(data[1]), "direction", hex(data[2])+"="+iostr)
         return data[3:]
                 
+    elif data[0] == 0x81 or  data[0] == 0x83:
+        print("Get Data Bits","low" if data[0] == 0x81 else "high")
+        return data[1:]
+        
     elif data[0] == 0x84:
         print("Connect loopback")
         return data[1:]
