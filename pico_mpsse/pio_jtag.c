@@ -192,7 +192,7 @@ void pio_jtag_write_tms(pio_jtag_inst_t* jtag, bool lsb, uint tdi, const uint8_t
   uint16_t tx_buffer[wlen];  // bytes are expanded to words for interleaved two-bit-transmission
   uint16_t tdi_mask = tdi?0x5555:0x0000;
   
-  for(int i;i<wlen;i++)
+  for(int i=0;i<wlen;i++)
     tx_buffer[i] = (interleave_table[lsb?reverse_table[src[i]]:src[i]]<<1) | tdi_mask;
 
   pio_jtag_blocking(jtag, (const uint8_t *)tx_buffer, dst, len);  
