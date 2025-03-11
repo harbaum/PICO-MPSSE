@@ -1,12 +1,13 @@
 # Pico MPPSE
 
-This is a FTDI MPSSE compatible JTAG implementation for the Raspberry
-Pi Pico's RP2040 MCU. It allows to use the Raspberry Pi Pico as a
-replacement for the FTDI MPSSE ftx232 device family and use the Pico
-e.g. as a flash adapter for FPGA boards.
+This is a MPSSE compatible JTAG implementation for the Raspberry Pi
+Pico's RP2040 MCU. It allows to use the Raspberry Pi Pico as a
+replacement for the MPSSE devices and use the Pico e.g. as a flash
+adapter for FPGA boards.
 
 This image shows an Efinix Trion T20 BGS256 Development Kit being
-programmed using a Raspberry Pi Pico and bypassing the on-board ft2232.
+programmed using a Raspberry Pi Pico and bypassing the on-board
+ft2232.
 
 ![Efinix T20 with Raspberry Pi Pico](efinix_pico.jpeg)
 

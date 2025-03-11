@@ -1,8 +1,13 @@
 /*
  * pico_mpsse.c
  *
- * FTDI MPSSE implementation for the Raspberry Pi Pico / RP2040
+ * MPSSE implementation for the Raspberry Pi Pico / RP2040
  * Intended to be used with openfpgaloader to load FPGAs
+ */
+
+/*
+  TODO:
+  - Handle read-only requests exceeding the reply buffer size  
  */
 
 #include <stdio.h>
@@ -24,14 +29,15 @@
 
 //#define DEBUG_BULK0
 //#define DEBUG_BULK1
-//#define DEBUG_REPLY
 //#define DEBUG_SHIFT
+//#define DEBUG_REPLY
 //#define DEBUG_GPIO
 //#define DEBUG_MPSSE
 //#define DEBUG_TRUNCATION
+//#define DEBUG_FLOWCONTROL
 
 // this is the dummy status reply sent in all replies
-#define FTDI_REPLY_STATUS   "\x32\x60"
+#define REPLY_STATUS   "\x32\x60"
 
 /* ---------------------------------------------------------------- */
 /* ----------------------------- USB ------------------------------ */
@@ -199,6 +205,7 @@ static struct usb_device_configuration dev_config = {
 	.ports[0].jtag.eps = { EP1_IN_ADDR, EP2_OUT_ADDR },
 	.ports[0].jtag.reply_len = 0,
 	.ports[0].jtag.tx_pending = false,
+	.ports[0].jtag.rx_disabled = false,
 	.ports[0].interface_descriptor = &interface_descriptor_p0,
 	.ports[0].endpoints = { {
 	    .descriptor = &ep1_in,
@@ -226,6 +233,7 @@ static struct usb_device_configuration dev_config = {
 	.ports[1].jtag.eps = { EP3_IN_ADDR, EP4_OUT_ADDR },
 	.ports[1].jtag.reply_len = 0,
 	.ports[1].jtag.tx_pending = false,
+	.ports[1].jtag.rx_disabled = false,
 	.ports[1].interface_descriptor = &interface_descriptor_p1,
 	.ports[1].endpoints = { {
 	    .descriptor = &ep3_in,
@@ -661,38 +669,46 @@ void usb_handle_setup_packet(void) {
     else if (pkt->bmRequestType == USB_VENDOR_OUT) {
       switch(pkt->bRequest) {
       case 0x00:
-	printf("FTDI RESET, #%d=%d\n", pkt->wIndex, pkt->wValue);
+	printf("RESET, #%d=%d\n", pkt->wIndex, pkt->wValue);
 
 	// TODO: check if this actually resets everything and returns to idle/all tristate
 	
 	break;
 
       case 0x01:
-	printf("FTDI SET MODEM CONTROL, #%d=%d\n", pkt->wIndex, pkt->wValue);
+	printf("SET MODEM CONTROL, #%d=%d\n", pkt->wIndex, pkt->wValue);
 	break;
 	
       case 0x02:
-	printf("FTDI SET FLOW CONTROL, #%d=%d\n", pkt->wIndex, pkt->wValue);
+	printf("SET FLOW CONTROL, #%d=%d\n", pkt->wIndex, pkt->wValue);
 	break;
 	
       case 0x03:
-	printf("FTDI SET BAUD RATE, #%d=%d\n", pkt->wIndex, pkt->wValue);
+	printf("SET BAUD RATE, #%d=%d\n", pkt->wIndex, pkt->wValue);
 	break;
 
       case 0x04:
-	printf("FTDI SET DATA, #%d=%d\n", pkt->wIndex, pkt->wValue);
+	printf("SET DATA, #%d=%d\n", pkt->wIndex, pkt->wValue);
 	break;
 
       case 0x05:
-	printf("FTDI POLL MODEM STATUS, #%d=0x%02x\n", pkt->wIndex, pkt->wValue);
+	printf("POLL MODEM STATUS, #%d=0x%02x\n", pkt->wIndex, pkt->wValue);
+	break;
+
+      case 0x06:
+	printf("SET EVENT CHARACTER, #%d=0x%02x\n", pkt->wIndex, pkt->wValue);
+	break;
+
+      case 0x07:
+	printf("SET ERROR CHARACTER, #%d=0x%02x\n", pkt->wIndex, pkt->wValue);
 	break;
 
       case 0x09:
-	printf("FTDI SET LATENCY TIMER, #%d=%d\n", pkt->wIndex, pkt->wValue);
+	printf("SET LATENCY TIMER, #%d=%d\n", pkt->wIndex, pkt->wValue);
 	break;
 
       case 0x0b:
-	printf("FTDI SET BITMODE, #%d=0x%02x\n", pkt->wIndex, pkt->wValue);
+	printf("SET BITMODE, #%d=0x%02x\n", pkt->wIndex, pkt->wValue);
 	if(pkt->wIndex >= 1 && pkt->wIndex <= 2) {
 	  struct jtag *jtag = &dev_config.ports[pkt->wIndex-1].jtag;
 	  
@@ -702,18 +718,19 @@ void usb_handle_setup_packet(void) {
 	break;
 
       case 0x91:
-	printf("FTDI WRITE EEPROM, #%d=%04x\n", pkt->wIndex, pkt->wValue);
+	printf("WRITE EEPROM, #%d=%04x\n", pkt->wIndex, pkt->wValue);
 	if(pkt->wIndex < 256) eeprom_dummy_data[pkt->wIndex] = pkt->wValue;
 	break;
 
       case 0x92:
-	printf("FTDI ERASE EEPROM, #%d=0x%04x\n", pkt->wIndex, pkt->wValue);
+	printf("ERASE EEPROM, #%d=0x%04x\n", pkt->wIndex, pkt->wValue);
 	// zero out our entire fake eeprom ...
 	memset(eeprom_dummy_data, 0, sizeof(eeprom_dummy_data));
 	break;
-	
+
       default:
-	printf("Unsupported vendor out request 0x%02x, #%d=%d\n", pkt->bRequest, pkt->wIndex, pkt->wValue);
+	printf("Unsupported vendor out request 0x%02x, #%d=%d\n",
+	       pkt->bRequest, pkt->wIndex, pkt->wValue);
 	break;	
       }
       usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
@@ -722,16 +739,16 @@ void usb_handle_setup_packet(void) {
     else if (pkt->bmRequestType == USB_VENDOR_IN) {
       switch(pkt->bRequest) {
       case 0x05:
-	printf("FTDI POLL MODEM STATUS\n");
-	usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), FTDI_REPLY_STATUS, 2);
+	printf("POLL MODEM STATUS\n");
+	usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), REPLY_STATUS, 2);
 	break;
 	
       case 0x90: // read eeprom
 	if(pkt->wIndex < 256) {
-	  printf("FTDI READ EEPROM, #%d=$%04x\n", pkt->wIndex, eeprom_dummy_data[pkt->wIndex]);
+	  printf("READ EEPROM, #%d=$%04x\n", pkt->wIndex, eeprom_dummy_data[pkt->wIndex]);
 	  usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), (uint8_t*)&(eeprom_dummy_data[pkt->wIndex]), 2);
 	} else {
-	  printf("FTDI READ EEPROM, #%d (out of range)\n", pkt->wIndex);
+	  printf("READ EEPROM, #%d (out of range)\n", pkt->wIndex);
 	  usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
 	}
 	break;
@@ -906,6 +923,37 @@ void ep0_out_handler(__unused uint8_t *buf, __unused uint16_t len) {
   // printf("EP0 OUT\n");  
 }
 
+static bool check_reply_buffer(struct jtag *jtag) {
+  // the reply buffer has a limited size. Once it runs
+  // too full we need to stop accepting incoming requests
+  // as the buffer may otherwise overflow. Since we cannot
+  // know how much data the next request will ask to be
+  // returned we stop the receiver once we have less than
+  // 64 bytes in the reply buffer left.
+
+  // reply_len does not include the two header bytes
+#ifdef DEBUG_FLOWCONTROL
+  printf("Reply buffer usage is %d of %d\n", jtag->reply_len+2, REPLY_BUFFER_SIZE);
+#endif
+  
+  if(jtag->reply_len+2 > REPLY_BUFFER_SIZE-64) {
+    // the buffer should actually never overflow
+    if(jtag->reply_len+2 > REPLY_BUFFER_SIZE)
+      printf(">>>>>>>>>>>>>> REPLY BUFFER DID OVERFLOW!!! <<<<<<<<<<<<<<<<<\n");
+#ifdef DEBUG_FLOWCONTROL
+    else
+      printf("FLOW: reply buffer may overflow\n");
+#endif
+      
+#ifdef DEBUG_FLOWCONTROL
+    // don't allow any more replies
+    printf("FLOW: stopping receiver\n");
+#endif
+    return false;
+  }
+  return true;
+}
+
 static uint16_t mpsse_cmd_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
 
   switch(buf[0]) {
@@ -939,6 +987,7 @@ static uint16_t mpsse_cmd_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
 #endif
     jtag->reply_buffer[jtag->reply_len+2] = reply;
     jtag->reply_len += 1;
+    check_reply_buffer(jtag);  // here for debugging only
     
     return 1;
     break;
@@ -1045,14 +1094,14 @@ static uint16_t mpsse_shift_parse(struct jtag *jtag, uint8_t *buf, uint16_t len)
       pio_jtag_write_tms(&jtag->pio, (cmd&8)?1:0, (buf[0]&0x80)?1:0, buf,
 		     (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL, shift_len);
       if(cmd & 0x20) jtag->reply_len += (shift_len+7)/8;
-
     } else {
       // printf("JTAG TDI BIT WRITE %d ", shift_len); hexdump(buf, 1);
       pio_jtag_write_tdi_read_tdo(&jtag->pio, (cmd&8)?1:0, (cmd & 0x10)?buf:NULL,
 			      (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL, shift_len);
       if(cmd & 0x20) jtag->reply_len += (shift_len+7)/8;
     }
-    
+
+    check_reply_buffer(jtag);  // here for debugging only
     return cmd_len;    
   }
 
@@ -1066,7 +1115,8 @@ static uint16_t mpsse_shift_parse(struct jtag *jtag, uint8_t *buf, uint16_t len)
   
 #ifdef DEBUG_SHIFT
   printf("MPSSE: shift %d bytes (%d avail)\n", shift_len, len-3);
-  hexdump(buf+3, shift_len);
+  if(shift_len > len-3) hexdump(buf+3, len-3);
+  else                  hexdump(buf+3, shift_len);
 #endif
 
   // it may happen that we are supposed to shift out more bits than we have payload
@@ -1078,6 +1128,7 @@ static uint16_t mpsse_shift_parse(struct jtag *jtag, uint8_t *buf, uint16_t len)
     pio_jtag_write_tdi_read_tdo(&jtag->pio, (cmd&8)?1:0, buf+3,
 	    (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL,(len-3)*8);
     if(cmd & 0x20) jtag->reply_len += (len-3);
+    check_reply_buffer(jtag);  // here for debugging only
     jtag->pending_writes = shift_len-(len-3);
     jtag->pending_write_cmd = cmd;
     
@@ -1087,6 +1138,8 @@ static uint16_t mpsse_shift_parse(struct jtag *jtag, uint8_t *buf, uint16_t len)
   pio_jtag_write_tdi_read_tdo(&jtag->pio, (cmd&8)?1:0, (cmd & 0x10)?(buf+3):NULL,
 			  (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL, shift_len*8);
   if(cmd & 0x20) jtag->reply_len += shift_len;
+  check_reply_buffer(jtag);  // here for debugging only
+
   return cmd_len;
 }
   
@@ -1110,14 +1163,14 @@ static void check_for_outgoing_data(struct jtag *jtag) {
 #endif
     
     // data is always stored from byte 2 on in the reply buffer, so that the
-    // ftdi status can be placed in front
-    memcpy(jtag->reply_buffer, FTDI_REPLY_STATUS, 2);
+    // status can be placed in front
+    memcpy(jtag->reply_buffer, REPLY_STATUS, 2);
 
     // as a full speed device we can return max 62 bytes per USB transfer
-    if(jtag->reply_len > 62) {
+    if(jtag->reply_len >= 62) {
       usb_start_transfer(usb_get_endpoint_configuration(jtag->eps[0]), jtag->reply_buffer, 64);
       // shift data down
-      memmove(jtag->reply_buffer, jtag->reply_buffer+62, 194);  // reply buffer is 256 bytes
+      memmove(jtag->reply_buffer+2, jtag->reply_buffer+64, REPLY_BUFFER_SIZE-64);
       jtag->reply_len -= 62;
     } else {    
       // Send all data back to host
@@ -1125,12 +1178,20 @@ static void check_for_outgoing_data(struct jtag *jtag) {
       jtag->reply_len = 0;
     }
     jtag->tx_pending = true;
+
+    if(jtag->rx_disabled && check_reply_buffer(jtag)) {
+#ifdef DEBUG_FLOWCONTROL
+      printf("FLOW: re-enable receiver\n");
+#endif
+      jtag->rx_disabled = false;
+      usb_start_transfer(usb_get_endpoint_configuration(jtag->eps[1]), NULL, 64);      
+    }
   } else {
 #ifdef DEBUG_REPLY
     printf("REPLY: no pending data\n");
 #endif
     
-    usb_start_transfer(usb_get_endpoint_configuration(jtag->eps[0]), FTDI_REPLY_STATUS, 2);    
+    usb_start_transfer(usb_get_endpoint_configuration(jtag->eps[0]), REPLY_STATUS, 2);    
     jtag->tx_pending = true;
   }
 }
@@ -1143,6 +1204,7 @@ static void mpsse_parse_all(struct jtag *jtag, uint8_t *buf, uint16_t len) {
     // return input state
     jtag->reply_buffer[jtag->reply_len + 2] = port_gpio_get(jtag);
     jtag->reply_len += 1;
+    check_reply_buffer(jtag);  // here for debugging only
   }
   
   // check if this port is in mpsse mode at all
@@ -1158,6 +1220,7 @@ static void mpsse_parse_all(struct jtag *jtag, uint8_t *buf, uint16_t len) {
 			      (jtag->pending_write_cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL,
 			      (uint32_t)bytes2shift*8);
       if(jtag->pending_write_cmd & 0x20) jtag->reply_len += bytes2shift;
+      check_reply_buffer(jtag);  // here for debugging only
       
       jtag->pending_writes -= bytes2shift;
       
@@ -1210,7 +1273,10 @@ void ep2_out_handler(uint8_t *buf, uint16_t len) {
   mpsse_parse_all(jtag, buf, len);
   
   // re-enable receiver
-  usb_start_transfer(usb_get_endpoint_configuration(EP2_OUT_ADDR), NULL, 64);
+  if(!check_reply_buffer(jtag))
+    jtag->rx_disabled = true;
+  else
+    usb_start_transfer(usb_get_endpoint_configuration(EP2_OUT_ADDR), NULL, 64);
 
   gpio_put(PICO_DEFAULT_LED_PIN, 0);
 }
@@ -1246,7 +1312,10 @@ void ep4_out_handler(uint8_t *buf, uint16_t len) {
   mpsse_parse_all(jtag, buf, len);
   
   // re-enable receiver
-  usb_start_transfer(usb_get_endpoint_configuration(EP4_OUT_ADDR), NULL, 64);
+  if(!check_reply_buffer(jtag))
+    jtag->rx_disabled = true;
+  else
+    usb_start_transfer(usb_get_endpoint_configuration(EP4_OUT_ADDR), NULL, 64);
 
   gpio_put(PICO_DEFAULT_LED_PIN, 0);
 }

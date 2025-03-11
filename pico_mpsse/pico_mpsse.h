@@ -29,10 +29,14 @@ struct usb_endpoint_configuration {
 
 #define MODE_MPSSE  2
 
+// the reply buffer should be able to hold two times the max endpoint
+// transfer size of 64 bytes
+#define REPLY_BUFFER_SIZE (128)
+
 struct jtag {
-  bool tx_pending;
+  bool tx_pending, rx_disabled;
   uint8_t reply_len;
-  uint8_t reply_buffer[256];
+  uint8_t reply_buffer[REPLY_BUFFER_SIZE];
   uint8_t eps[2];
   uint16_t pending_writes;
   uint8_t pending_write_cmd;
@@ -201,7 +205,7 @@ static const unsigned char lang_descriptor[] = {
 };
 
 static const unsigned char *descriptor_strings[] = {
-        (unsigned char *) "Not FTDI",        // Vendor
+        (unsigned char *) "NoFuture",        // Vendor
         (unsigned char *) "Pico MPSSE"       // Product
 };
 
