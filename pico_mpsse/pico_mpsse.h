@@ -29,18 +29,38 @@ struct usb_endpoint_configuration {
 
 #define MODE_MPSSE  2
 
-// the reply buffer should be able to hold two times the max endpoint
-// transfer size of 64 bytes
-#define REPLY_BUFFER_SIZE (128)
+// the reply buffer should be able to hold at least two times the max endpoint
+// transfer size of 64 bytes. Since the pico will stop accepting incoming requests
+// via USB while the output buffer is full the buffer should actually be at least
+// 256 bytes
+#define REPLY_BUFFER_SIZE (1024)
 
 struct jtag {
   bool tx_pending, rx_disabled;
-  uint8_t reply_len;
+  uint16_t reply_len;
   uint8_t reply_buffer[REPLY_BUFFER_SIZE];
   uint8_t eps[2];
   uint16_t pending_writes;
   uint8_t pending_write_cmd;
   uint8_t mode;  // 2=MPSSE
+
+  // command buffer to assemble incoming mpsse commands
+  // which may be split over multiple usb transfers
+  struct {
+    union {
+      uint8_t bytes[4];
+      struct {
+	uint8_t code;
+	union {
+	  uint8_t b[2];
+	  uint16_t w;
+	};
+	uint8_t dummy;  // used by CPU command only
+      } __attribute__((packed)) cmd;
+    } data;
+    uint8_t len;
+  } cmd_buf;
+  
   pio_jtag_inst_t pio;
 };
 

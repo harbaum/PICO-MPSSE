@@ -27,14 +27,16 @@
 #include "pio_jtag.h"
 #include "config.h"
 
-//#define DEBUG_BULK0
-//#define DEBUG_BULK1
-//#define DEBUG_SHIFT
-//#define DEBUG_REPLY
-//#define DEBUG_GPIO
-//#define DEBUG_MPSSE
-//#define DEBUG_TRUNCATION
-//#define DEBUG_FLOWCONTROL
+#if 0
+#define DEBUG_BULK0
+#define DEBUG_BULK1
+#define DEBUG_SHIFT
+#define DEBUG_REPLY
+#define DEBUG_GPIO
+#define DEBUG_MPSSE
+#define DEBUG_TRUNCATION
+#define DEBUG_FLOWCONTROL
+#endif
 
 // this is the dummy status reply sent in all replies
 #define REPLY_STATUS   "\x32\x60"
@@ -206,6 +208,7 @@ static struct usb_device_configuration dev_config = {
 	.ports[0].jtag.reply_len = 0,
 	.ports[0].jtag.tx_pending = false,
 	.ports[0].jtag.rx_disabled = false,
+	.ports[0].jtag.cmd_buf.len = 0,
 	.ports[0].interface_descriptor = &interface_descriptor_p0,
 	.ports[0].endpoints = { {
 	    .descriptor = &ep1_in,
@@ -234,6 +237,7 @@ static struct usb_device_configuration dev_config = {
 	.ports[1].jtag.reply_len = 0,
 	.ports[1].jtag.tx_pending = false,
 	.ports[1].jtag.rx_disabled = false,
+	.ports[1].jtag.cmd_buf.len = 0,
 	.ports[1].interface_descriptor = &interface_descriptor_p1,
 	.ports[1].endpoints = { {
 	    .descriptor = &ep3_in,
@@ -954,201 +958,187 @@ static bool check_reply_buffer(struct jtag *jtag) {
   return true;
 }
 
-static uint16_t mpsse_cmd_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
-
-  switch(buf[0]) {
+// parse a non-shifting MPSSE command
+static uint16_t mpsse_cmd_parse(struct jtag *jtag) {
+  uint8_t cmd = jtag->cmd_buf.data.cmd.code;
+  
+  switch(cmd) {
   case 0x80:
   case 0x82:
-    if(len < 3) return 0;  // needs at least 3 bytes
+    uint8_t value = jtag->cmd_buf.data.cmd.b[0];
+    uint8_t dir = jtag->cmd_buf.data.cmd.b[1];
+    
 #ifdef DEBUG_MPSSE
-    printf("MPSSE: Set data bits %s value 0x%02x, dir 0x%02x=", (buf[0]&2)?"high":"low", buf[1], buf[2]);
-    for(int i=0;i<8;i++) printf("%c", (buf[2]&(0x80>>i))?'O':'I');
+    printf("MPSSE: Set data bits %s value 0x%02x, dir 0x%02x=", (cmd&2)?"high":"low", value, dir);
+    for(int i=0;i<8;i++) printf("%c", (dir&(0x80>>i))?'O':'I');
     printf("\n");
 #endif
     
     /* we currently only support the lower bits */
-    if(!(buf[0]&2)) {
+    if(!(cmd&2)) {
       // second payload byte is direction. Lowest bits 0xb is JTAG (and SPI) mapping
-      port_gpio_set_dir(jtag, buf[2]);
-      port_gpio_set(jtag, buf[1]);
+      port_gpio_set_dir(jtag, dir);
+      port_gpio_set(jtag, value);
     }
-    return 3;
+    break;
                 
   case 0x81:
   case 0x83:
-    // send input state in a reply byte
     uint8_t reply = 0;
 
     // only low byte supported
-    if(!(buf[0]&2)) reply = port_gpio_get(jtag);
+    if(!(cmd&2)) reply = port_gpio_get(jtag);
       
 #ifdef DEBUG_MPSSE
-    printf("MPSSE: Get data bits %s: 0x%02x\n", (buf[0]&2)?"high":"low", reply);
+    printf("MPSSE: Get data bits %s: 0x%02x\n", (cmd&2)?"high":"low", reply);
 #endif
     jtag->reply_buffer[jtag->reply_len+2] = reply;
-    jtag->reply_len += 1;
-    check_reply_buffer(jtag);  // here for debugging only
-    
-    return 1;
+    jtag->reply_len += 1;    
     break;
     
   case 0x84:
 #ifdef DEBUG_MPSSE
     printf("MPSSE: Connect loopback\n");
 #endif
-    return 1;
+    break;
 
   case 0x85:
 #ifdef DEBUG_MPSSE
     printf("MPSSE: Disconnect loopback\n");
 #endif
-    return 1;
+    break;
 
   case 0x86: {
-    if(len < 3) return 0;  // needs at least 3 bytes    
-    int divisor = buf[1] + 256*buf[2];
+    // send input state in a reply byte
+    int divisor = jtag->cmd_buf.data.cmd.w;
     int rate = 12000000 / ((1+divisor) * 2);
 #ifdef DEBUG_MPSSE
     printf("MPSSE: Set PIO %d TCK/SK Divisor to %d = %d Mhz\n", PIO_INDEX(&jtag->pio), divisor, rate/1000000);
 #endif
     pio_jtag_set_clk_freq(&jtag->pio, rate/1000);
-    return 3;
-  }
+  } break;
 
   case 0x87:
 #ifdef DEBUG_MPSSE
     printf("MPSSE: Flush\n");
 #endif
-    return 1;
+    break;
 
   case 0x8a:
 #ifdef DEBUG_MPSSE
     printf("MPSSE: Disable div by 5 (60MHz master clock)\n");
 #endif
-    return 1;
+    break;
         
   case 0x8b:
 #ifdef DEBUG_MPSSE
     printf("MPSSE: Enable div by 5 (12MHz master clock)\n");
 #endif
-    return 1;
-
+    break;
   }
-  return 1;
+  return 0;
 }
 
-// According to the AN 108, only six TMS opcodes actually exist.
-// These are 0x4a, 0x4b, 0x6a, 0x6b, 0x6e and 0x6f
-// 0x4a = 0b01001010
-// 0x4b = 0b01001011
-// 0x6a = 0b01101010
-// 0x6b = 0b01101011
-// 0x6e = 0b01101110
-// 0x6f = 0b01101111
+static uint16_t mpsse_shift_bits(struct jtag *jtag) {
+  uint8_t cmd = jtag->cmd_buf.data.cmd.code;
 
-// BIT is always set, LSB is always set and W-TDI is never set 
-// -> no TMS byte write exists
-
-static uint16_t mpsse_shift_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
   // calculate data shift length
-  uint16_t cmd_len = 0;
-  uint16_t shift_len = 0;
-  uint8_t cmd = buf[0];
+  uint16_t shift_len = jtag->cmd_buf.data.cmd.b[0]+1; // shift length was given in bits-1
 
-  // printf("CMD "); hexdump(buf, len);
+  // request to write something? TDI or TMS?
+  uint8_t data;
+  if(cmd & 0x50) data = jtag->cmd_buf.data.cmd.b[1];
   
-  /* mpsse command bits  
-     0: W-VE
-     1: BIT
-     2: R-VE
-     3: LSB
-     4: W-TDI
-     5: R-TDO
-     6: W-TMS
-     7: 0
-  */
-
-  if(cmd & 2) {
-    // length is in bits, total command length is 3
-    if(len < 2) return 0;    // needs at last cmd,len
-    shift_len = buf[1] + 1;  // shift length was given in bits-1
-    // write TDI or TMS?
-    if(cmd & 0x50) {
-      // write bits has one additional payload byte    
-      if(len < 3) return 0;
-      cmd_len = 3;
-      buf += 2;
-    } else {
-      // read-only bits
-      cmd_len = 2;
-      buf += 1;
-    }
-
 #ifdef DEBUG_SHIFT
-    printf("MPSSE: shift %d bits\n", shift_len);
-    hexdump(buf, (shift_len+7)/8);
+  printf("MPSSE: shift %d bits\n", shift_len);
+  hexdump(&data, (shift_len+7)/8);
 #endif
-
-    if(cmd & 0x40) {
-      // printf("JTAG TMS BIT WRITE %d ", shift_len); hexdump(buf, 1);
-      pio_jtag_write_tms(&jtag->pio, (cmd&8)?1:0, (buf[0]&0x80)?1:0, buf,
-		     (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL, shift_len);
-      if(cmd & 0x20) jtag->reply_len += (shift_len+7)/8;
-    } else {
-      // printf("JTAG TDI BIT WRITE %d ", shift_len); hexdump(buf, 1);
-      pio_jtag_write_tdi_read_tdo(&jtag->pio, (cmd&8)?1:0, (cmd & 0x10)?buf:NULL,
-			      (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL, shift_len);
-      if(cmd & 0x20) jtag->reply_len += (shift_len+7)/8;
-    }
-
-    check_reply_buffer(jtag);  // here for debugging only
-    return cmd_len;    
+  
+  if(cmd & 0x40) {
+    // printf("JTAG TMS BIT WRITE %d ", shift_len); hexdump(buf, 1);
+    pio_jtag_write_tms(&jtag->pio, (cmd&8)?1:0, (data&0x80)?1:0, &data,
+		       (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL, shift_len);
+    if(cmd & 0x20) jtag->reply_len += (shift_len+7)/8;
+  } else {
+    // printf("JTAG TDI BIT WRITE %d ", shift_len); hexdump(buf, 1);
+    pio_jtag_write_tdi_read_tdo(&jtag->pio, (cmd&8)?1:0, (cmd & 0x10)?&data:NULL,
+				(cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL, shift_len);
+    if(cmd & 0x20) jtag->reply_len += (shift_len+7)/8;
   }
+  
+  return 0;  // no additional bytes used
+} 
+
+static uint16_t mpsse_shift_bytes(struct jtag *jtag, uint8_t *buf, uint16_t len) {
+  uint8_t cmd = jtag->cmd_buf.data.cmd.code;
 
   // length is given in bytes and command length is variable
-  if(len < 3) return 0;                // needs at least cmd,len16
-  shift_len = buf[1] + 256*buf[2] + 1; // shift length was given in bytes-1
+  uint16_t shift_len = jtag->cmd_buf.data.cmd.w + 1;
 
-  // W-TDI set?
-  if(cmd & 0x10) cmd_len = 3+shift_len;
-  else           cmd_len = 3;
-  
 #ifdef DEBUG_SHIFT
-  printf("MPSSE: shift %d bytes (%d avail)\n", shift_len, len-3);
-  if(shift_len > len-3) hexdump(buf+3, len-3);
-  else                  hexdump(buf+3, shift_len);
+  printf("MPSSE: shift %d bytes (%d avail)\n", shift_len, len);
+  if(shift_len > len) hexdump(buf, len);
+  else                hexdump(buf, shift_len);
 #endif
 
   // it may happen that we are supposed to shift out more bits than we have payload
-  if((cmd & 0x10) && (3+shift_len > len)) {
+  if((cmd & 0x10) && (shift_len > len)) {
 #ifdef DEBUG_TRUNCATION
-    printf("Trunc write %d to %d\n", shift_len, len-3);
+    printf("Trunc write %d to %d\n", shift_len, len);
 #endif
 
-    pio_jtag_write_tdi_read_tdo(&jtag->pio, (cmd&8)?1:0, buf+3,
-	    (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL,(len-3)*8);
-    if(cmd & 0x20) jtag->reply_len += (len-3);
-    check_reply_buffer(jtag);  // here for debugging only
-    jtag->pending_writes = shift_len-(len-3);
+    pio_jtag_write_tdi_read_tdo(&jtag->pio, (cmd&8)?1:0, buf,
+	    (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL,len*8);
+    if(cmd & 0x20) jtag->reply_len += len;
+    jtag->pending_writes = shift_len-len;
     jtag->pending_write_cmd = cmd;
-    
-    return len;   // all consumed that was there so far
+
+    return len;  // all data consumed that was there
   }
 
-  pio_jtag_write_tdi_read_tdo(&jtag->pio, (cmd&8)?1:0, (cmd & 0x10)?(buf+3):NULL,
-			  (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL, shift_len*8);
+  // there is either no data to be sent or the data present is sufficient for
+  // the full transfer
+  pio_jtag_write_tdi_read_tdo(&jtag->pio, (cmd&8)?1:0, (cmd & 0x10)?buf:NULL,
+			      (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL,
+			      shift_len*8);
   if(cmd & 0x20) jtag->reply_len += shift_len;
-  check_reply_buffer(jtag);  // here for debugging only
+  
+  // W-TDI set? There was payload used
+  return (cmd & 0x10)?shift_len:0;
+}
 
-  return cmd_len;
+static uint16_t mpsse_shift_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
+  // get command byte
+  uint8_t cmd = jtag->cmd_buf.data.cmd.code;
+
+  /* mpsse command bits  
+     0: W-VE  1: BIT  2: R-VE  3: LSB  4: W-TDI  5: R-TDO  6: W-TMS  7: 0 */
+
+  // check if it's an allowed command as not all possible command bit patterns are
+  // actually valid. 
+  if((cmd != 0x10) && (cmd != 0x11) && (cmd != 0x12) && (cmd != 0x13) &&
+     (cmd != 0x18) && (cmd != 0x19) && (cmd != 0x1a) && (cmd != 0x1b) &&
+     (cmd != 0x20) && (cmd != 0x22) && (cmd != 0x24) && (cmd != 0x26) &&
+     (cmd != 0x28) && (cmd != 0x2a) && (cmd != 0x2c) && (cmd != 0x2e) &&
+     (cmd != 0x31) && (cmd != 0x33) && (cmd != 0x34) && (cmd != 0x36) &&
+     (cmd != 0x39) && (cmd != 0x3b) && (cmd != 0x3c) && (cmd != 0x3e) &&
+     // TMS commands
+     (cmd != 0x4a) && (cmd != 0x4b) && (cmd != 0x6a) && (cmd != 0x6b) &&
+     (cmd != 0x6e) && (cmd != 0x6f)) {
+
+    // reply with 0xfa / bad command
+    jtag->reply_buffer[2+jtag->reply_len++] = 0xfa;    
+    return 0;
+  }
+  
+  if(cmd & 2) return mpsse_shift_bits(jtag);
+  else        return mpsse_shift_bytes(jtag, buf, len);
 }
   
-static uint16_t mpsse_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
-  if(!len) return 0;  // nothing parsed as there was nothing to parse
-
-  if(buf[0] & 0x80)
-    return mpsse_cmd_parse(jtag, buf, len);
-
+static uint16_t mpsse_parse_cmd(struct jtag *jtag, uint8_t *buf, uint16_t len) {
+  if(jtag->cmd_buf.data.cmd.code & 0x80)
+    return mpsse_cmd_parse(jtag);
+    
   return mpsse_shift_parse(jtag, buf, len);
 }
 
@@ -1196,7 +1186,52 @@ static void check_for_outgoing_data(struct jtag *jtag) {
   }
 }
 
-static void mpsse_parse_all(struct jtag *jtag, uint8_t *buf, uint16_t len) {
+// get command size incl. length bytes or the like. But without the
+// payload of the byte stream command
+static uint8_t mpsse_cmd_size(uint8_t cmd) {
+  if(cmd & 0x80) {
+    // generic MPSSE command
+
+    // command and one more byte
+    if((cmd == 0x90) ||   // CPUMode read short address
+       (cmd == 0x8e))     // clock for n bits with no data transfer
+      return 2;	
+	
+    // command and two more bytes
+    if((cmd == 0x80) || (cmd == 0x82) || // set data bits
+       (cmd == 0x86) || // set divisor
+       (cmd == 0x91) || // CPUMode read extended address
+       (cmd == 0x92) || // CPUMode write short address
+
+       (cmd == 0x8f) || // clock for n*8 bits with no data transfer
+       (cmd == 0x9c) || // clock for n*8 bits with no data transfer until gpio high
+       (cmd == 0x9d) || // clock for n*8 bits with no data transfer until gpio low
+       (cmd == 0x9e))   // set IO to only drive on a '0' and tristate on '1'
+      return 3;
+
+    // command and three more bytes
+    if(cmd == 0x93)     // CPUMode write extended address
+      return 4;
+
+    // otherwise no additional bytes needed, just the command itself
+    return 1;
+  }
+
+  // shift commands
+  if(cmd & 0x02) {
+    // bit commands have an additional  byte length and a byte payload ...
+    if(cmd & 0x50)
+      return 3;
+
+    // ... unless they are read-only, then they have only the byte length
+    return 2;
+  }
+  
+  // byte shift commands always need an additional two byte length
+  return 3;
+}
+
+static void mpsse_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
   if(jtag->mode == 1) {
     printf("BITBANG\n");
 
@@ -1204,7 +1239,6 @@ static void mpsse_parse_all(struct jtag *jtag, uint8_t *buf, uint16_t len) {
     // return input state
     jtag->reply_buffer[jtag->reply_len + 2] = port_gpio_get(jtag);
     jtag->reply_len += 1;
-    check_reply_buffer(jtag);  // here for debugging only
   }
   
   // check if this port is in mpsse mode at all
@@ -1228,12 +1262,23 @@ static void mpsse_parse_all(struct jtag *jtag, uint8_t *buf, uint16_t len) {
       buf += bytes2shift;
       if(!len) return;
     }
-    
-    int x = mpsse_parse(jtag, buf, len);
-    while(x && len) {
-      buf += x;
-      len -= x;
-      x = mpsse_parse(jtag, buf, len);
+
+    // process the entire payload
+    while(len) {
+      // add byte to command buffer. We don't need to check for buffer overflows since the
+      // following check against mpsse_cmd_size() will always trigger before
+      jtag->cmd_buf.data.bytes[jtag->cmd_buf.len++] = *buf++;
+      len--;
+
+      // check if there's a full command in buffer
+      if(jtag->cmd_buf.len && mpsse_cmd_size(jtag->cmd_buf.data.cmd.code) <= jtag->cmd_buf.len) {
+	int x = mpsse_parse_cmd(jtag, buf, len);
+	buf += x;
+	len -= x;
+	
+	// flush the command buffer
+	jtag->cmd_buf.len = 0;
+      }
     }
   } else {
     printf("Ignoring DATA in default mode\n");
@@ -1270,7 +1315,7 @@ void ep2_out_handler(uint8_t *buf, uint16_t len) {
   hexdump(buf, len);
 #endif
   
-  mpsse_parse_all(jtag, buf, len);
+  mpsse_parse(jtag, buf, len);
   
   // re-enable receiver
   if(!check_reply_buffer(jtag))
@@ -1309,7 +1354,7 @@ void ep4_out_handler(uint8_t *buf, uint16_t len) {
   hexdump(buf, len);
 #endif
   
-  mpsse_parse_all(jtag, buf, len);
+  mpsse_parse(jtag, buf, len);
   
   // re-enable receiver
   if(!check_reply_buffer(jtag))
